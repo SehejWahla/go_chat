@@ -187,39 +187,15 @@ func (s *Server) handleRedisMessages() {
 					s.storePendingMessage(msgPacket)
 				}
 			case "forward_group_message":
-				groupID := message["group_id"].(string)
+				// Existing group message handling
+			case "forward_notification":
+				toUserID := message["to"].(string)
 				payload := message["payload"].(string)
-				// Either use the members variable or don't declare it
-				members, ok := message["members"].([]interface{})
-				if !ok {
-					log.Printf("Error: invalid or missing members for group %s", groupID)
-					continue
-				}
-
-				var msgPacket MessagePacket
-				if err := json.Unmarshal([]byte(payload), &msgPacket); err != nil {
-					log.Printf("Error unmarshaling group message for group %s: %v", groupID, err)
-					continue
-				}
-
-				// Process the group message and deliver to members
-				for _, member := range members {
-					memberID, ok := member.(string)
-					if !ok {
-						continue
-					}
-
-					s.connectionsMux.RLock()
-					recipient, ok := s.connections[memberID]
-					s.connectionsMux.RUnlock()
-
-					if ok && recipient.IsConnected {
-						recipient.Send <- []byte(payload)
-						s.sendMessageAck(msgPacket.ID, memberID, msgPacket.From, "delivered")
-					} else {
-						// Store as pending for this member
-						s.storePendingMessage(msgPacket)
-					}
+				s.connectionsMux.RLock()
+				client, ok := s.connections[toUserID]
+				s.connectionsMux.RUnlock()
+				if ok && client.IsConnected {
+					client.Send <- []byte(payload)
 				}
 			case "message_ack":
 				messageID := message["message_id"].(string)
