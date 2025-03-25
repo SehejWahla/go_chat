@@ -12,13 +12,13 @@ services:
       - KAFKA_BOOTSTRAP_SERVERS=${KAFKA_BOOTSTRAP_SERVERS}
       - KAFKA_API_KEY=${KAFKA_API_KEY}
       - KAFKA_API_SECRET=${KAFKA_API_SECRET}
-      - REDIS_ADDR=redis:6379
-      - MONGO_URI=mongodb://mongo:27017
+      - REDIS_HOST=redis-16702.c124.us-central1-1.gce.redns.redis-cloud.com
+      - REDIS_PORT=16702
+      - REDIS_USERNAME=default
+      - REDIS_PASSWORD=C9vQpbNP9YqVj1OeHmXTpCxlDKk4TxA0
+      - MONGO_URI=mongodb+srv://sehej:Passw0rd942@wobitech.n7ilc.mongodb.net/wobichat-db?retryWrites=true&w=majority&appName=wobitech
       - PORT=8080
       - SERVICE_INSTANCE_ID=instance-1
-    depends_on:
-      - redis
-      - mongo
     restart: unless-stopped
 
   chat-service-2:
@@ -32,33 +32,11 @@ services:
       - KAFKA_BOOTSTRAP_SERVERS=${KAFKA_BOOTSTRAP_SERVERS}
       - KAFKA_API_KEY=${KAFKA_API_KEY}
       - KAFKA_API_SECRET=${KAFKA_API_SECRET}
-      - REDIS_ADDR=redis:6379
-      - MONGO_URI=mongodb://mongo:27017
+      - REDIS_HOST=redis-16702.c124.us-central1-1.gce.redns.redis-cloud.com
+      - REDIS_PORT=16702
+      - REDIS_USERNAME=default
+      - REDIS_PASSWORD=C9vQpbNP9YqVj1OeHmXTpCxlDKk4TxA0
+      - MONGO_URI=mongodb+srv://sehej:Passw0rd942@wobitech.n7ilc.mongodb.net/wobichat-db?retryWrites=true&w=majority&appName=wobitech
       - PORT=8080
       - SERVICE_INSTANCE_ID=instance-2
-    depends_on:
-      - redis
-      - mongo
     restart: unless-stopped
-
-  redis:
-    image: redis:alpine
-    container_name: chat-redis
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis-data:/data
-    restart: unless-stopped
-
-  mongo:
-    image: mongo:5
-    container_name: chat-mongo
-    ports:
-      - "27017:27017"
-    volumes:
-      - mongo-data:/data/db
-    restart: unless-stopped
-
-volumes:
-  redis-data:
-  mongo-data:

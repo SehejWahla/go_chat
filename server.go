@@ -90,16 +90,25 @@ func (s *Server) Initialize() error {
 }
 
 func (s *Server) connectToRedis() error {
-	redisAddr := os.Getenv("REDIS_ADDR")
-	if redisAddr == "" {
-		redisAddr = "localhost:6379"
+	redisHost := os.Getenv("REDIS_HOST")
+	redisPort := os.Getenv("REDIS_PORT")
+	redisUsername := os.Getenv("REDIS_USERNAME")
+	redisPassword := os.Getenv("REDIS_PASSWORD")
+
+	// Check if required variables are set
+	if redisHost == "" || redisPort == "" {
+		return fmt.Errorf("REDIS_HOST and REDIS_PORT must be set")
 	}
+
 	s.redisClient = redis.NewClient(&redis.Options{
-		Addr: redisAddr,
+		Addr:     fmt.Sprintf("%s:%s", redisHost, redisPort),
+		Username: redisUsername, // Optional, defaults to "" if not set
+		Password: redisPassword, // Optional, defaults to "" if not set
 	})
+
 	_, err := s.redisClient.Ping(s.ctx).Result()
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to connect to Redis: %v", err)
 	}
 	log.Println("Connected to Redis")
 	return nil
@@ -108,19 +117,19 @@ func (s *Server) connectToRedis() error {
 func (s *Server) connectToMongoDB() error {
 	mongoURI := os.Getenv("MONGO_URI")
 	if mongoURI == "" {
-		mongoURI = "mongodb://localhost:27017"
+		return fmt.Errorf("MONGO_URI environment variable is not set")
 	}
 	clientOptions := options.Client().ApplyURI(mongoURI)
 	var err error
 	s.mongoClient, err = mongo.Connect(s.ctx, clientOptions)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to connect to MongoDB: %v", err)
 	}
 	if err = s.mongoClient.Ping(s.ctx, nil); err != nil {
-		return err
+		return fmt.Errorf("MongoDB ping failed: %v", err)
 	}
 	if err := s.createMongoDBIndexes(); err != nil {
-		return err
+		return fmt.Errorf("failed to create MongoDB indexes: %v", err)
 	}
 	log.Println("Connected to MongoDB")
 	return nil
