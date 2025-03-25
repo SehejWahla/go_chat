@@ -1,4 +1,5 @@
 // ./env
+
 # Kafka Configuration (Confluent Cloud)
 KAFKA_BOOTSTRAP_SERVERS=pkc-921jm.us-east-2.aws.confluent.cloud:9092
 KAFKA_API_KEY=JUHXV3WXBZE4XCJ6
@@ -9,12 +10,18 @@ REDIS_ADDR=redis:6379
 REDIS_PASSWORD=
 
 # MongoDB Configuration
-MONGO_URI=mongodb://mongo:27017
+MONGO_URI=mongodb+srv://sehej:Passw0rd942@wobitech.n7ilc.mongodb.net/wobichat-db?retryWrites=true&w=majority&appName=wobitech
+
+# .env
+REDIS_HOST=redis-16702.c124.us-central1-1.gce.redns.redis-cloupd.com
+REDIS_PORT=16702
+REDIS_USERNAME=default
+REDIS_PASSWORD=C9vQpbNP9YqVj1OeHmXTpCxlDKk4TxA0
 
 # Server Configuration
 PORT=8080
 
-// ./client
+// ./client.go
 package main
 
 import (
@@ -224,8 +231,7 @@ func contains(slice []string, item string) bool {
 }
 
 
-
-// ./docker-compose.ym;
+// ./docker-compose.yml
 version: '3.8'
 
 services:
@@ -240,13 +246,13 @@ services:
       - KAFKA_BOOTSTRAP_SERVERS=${KAFKA_BOOTSTRAP_SERVERS}
       - KAFKA_API_KEY=${KAFKA_API_KEY}
       - KAFKA_API_SECRET=${KAFKA_API_SECRET}
-      - REDIS_ADDR=redis:6379
-      - MONGO_URI=mongodb://mongo:27017
+      - REDIS_HOST=redis-16702.c124.us-central1-1.gce.redns.redis-cloud.com
+      - REDIS_PORT=16702
+      - REDIS_USERNAME=default
+      - REDIS_PASSWORD=C9vQpbNP9YqVj1OeHmXTpCxlDKk4TxA0
+      - MONGO_URI=mongodb+srv://sehej:Passw0rd942@wobitech.n7ilc.mongodb.net/wobichat-db?retryWrites=true&w=majority&appName=wobitech
       - PORT=8080
       - SERVICE_INSTANCE_ID=instance-1
-    depends_on:
-      - redis
-      - mongo
     restart: unless-stopped
 
   chat-service-2:
@@ -260,40 +266,18 @@ services:
       - KAFKA_BOOTSTRAP_SERVERS=${KAFKA_BOOTSTRAP_SERVERS}
       - KAFKA_API_KEY=${KAFKA_API_KEY}
       - KAFKA_API_SECRET=${KAFKA_API_SECRET}
-      - REDIS_ADDR=redis:6379
-      - MONGO_URI=mongodb://mongo:27017
+      - REDIS_HOST=redis-16702.c124.us-central1-1.gce.redns.redis-cloud.com
+      - REDIS_PORT=16702
+      - REDIS_USERNAME=default
+      - REDIS_PASSWORD=C9vQpbNP9YqVj1OeHmXTpCxlDKk4TxA0
+      - MONGO_URI=mongodb+srv://sehej:Passw0rd942@wobitech.n7ilc.mongodb.net/wobichat-db?retryWrites=true&w=majority&appName=wobitech
       - PORT=8080
       - SERVICE_INSTANCE_ID=instance-2
-    depends_on:
-      - redis
-      - mongo
     restart: unless-stopped
 
-  redis:
-    image: redis:alpine
-    container_name: chat-redis
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis-data:/data
-    restart: unless-stopped
 
-  mongo:
-    image: mongo:5
-    container_name: chat-mongo
-    ports:
-      - "27017:27017"
-    volumes:
-      - mongo-data:/data/db
-    restart: unless-stopped
-
-volumes:
-  redis-data:
-  mongo-data:
-
-
-  // ./Dockerfile
-  FROM golang:1.19 AS builder
+// ./Dockerfile
+FROM golang:1.19 AS builder
 
 # Install required packages for Confluent Kafka
 RUN apt-get update && apt-get install -y \
@@ -662,75 +646,7 @@ func (k *KafkaClient) Close() error {
 
 
 // ./main.go
-package main
 
-import (
-	"context"
-	"log"
-	"net/http"
-	"os"
-	"os/signal"
-	"syscall"
-	"time"
-
-	"github.com/gorilla/mux"
-	"github.com/joho/godotenv"
-)
-
-func main() {
-	godotenv.Load()
-
-	server, err := NewServer()
-	if err != nil {
-		log.Fatalf("Failed to create server: %v", err)
-	}
-
-	if err := server.Initialize(); err != nil {
-		log.Fatalf("Failed to initialize server: %v", err)
-	}
-
-	router := mux.NewRouter()
-	server.RegisterRoutes(router)
-
-	httpServer := &http.Server{
-		Addr:    ":" + os.Getenv("PORT"),
-		Handler: router,
-	}
-	if httpServer.Addr == ":" {
-		httpServer.Addr = ":8080"
-	}
-
-	go func() {
-		log.Printf("Starting server on %s", httpServer.Addr)
-		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("Failed to start server: %v", err)
-		}
-	}()
-
-	if err := server.kafkaClient.StartConsumers(server); err != nil {
-		log.Fatalf("Failed to start Kafka consumers: %v", err)
-	}
-
-	go server.StartBatchProcessor()
-
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
-	<-stop
-	log.Println("Shutting down server...")
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	if err := httpServer.Shutdown(ctx); err != nil {
-		log.Fatalf("Server shutdown failed: %v", err)
-	}
-
-	server.Shutdown()
-	log.Println("Server shutdown complete")
-}
-
-
-// ./main.go
 package main
 
 import (
@@ -942,32 +858,6 @@ http {
     }
 }
 
-
-// ./setup.sh
-#!/bin/bash
-
-# Install dependencies
-echo "Installing dependencies..."
-go mod tidy
-
-# Build the application
-echo "Building the application..."
-go build -o chat-service .
-
-# Start Docker services
-echo "Starting Docker services..."
-docker-compose up -d
-
-# Check if Docker services are running
-echo "Checking Docker services..."
-docker-compose ps
-
-echo "Setup complete! The application is now running."
-echo "Service endpoints:"
-echo "- Chat service 1: http://localhost:8080"
-echo "- Chat service 2: http://localhost:8081"
-echo "- Load balancer: http://localhost:80"
-
 // ./server.go
 package main
 
@@ -1061,16 +951,25 @@ func (s *Server) Initialize() error {
 }
 
 func (s *Server) connectToRedis() error {
-	redisAddr := os.Getenv("REDIS_ADDR")
-	if redisAddr == "" {
-		redisAddr = "localhost:6379"
+	redisHost := os.Getenv("REDIS_HOST")
+	redisPort := os.Getenv("REDIS_PORT")
+	redisUsername := os.Getenv("REDIS_USERNAME")
+	redisPassword := os.Getenv("REDIS_PASSWORD")
+
+	// Check if required variables are set
+	if redisHost == "" || redisPort == "" {
+		return fmt.Errorf("REDIS_HOST and REDIS_PORT must be set")
 	}
+
 	s.redisClient = redis.NewClient(&redis.Options{
-		Addr: redisAddr,
+		Addr:     fmt.Sprintf("%s:%s", redisHost, redisPort),
+		Username: redisUsername, // Optional, defaults to "" if not set
+		Password: redisPassword, // Optional, defaults to "" if not set
 	})
+
 	_, err := s.redisClient.Ping(s.ctx).Result()
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to connect to Redis: %v", err)
 	}
 	log.Println("Connected to Redis")
 	return nil
@@ -1079,19 +978,19 @@ func (s *Server) connectToRedis() error {
 func (s *Server) connectToMongoDB() error {
 	mongoURI := os.Getenv("MONGO_URI")
 	if mongoURI == "" {
-		mongoURI = "mongodb://localhost:27017"
+		return fmt.Errorf("MONGO_URI environment variable is not set")
 	}
 	clientOptions := options.Client().ApplyURI(mongoURI)
 	var err error
 	s.mongoClient, err = mongo.Connect(s.ctx, clientOptions)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to connect to MongoDB: %v", err)
 	}
 	if err = s.mongoClient.Ping(s.ctx, nil); err != nil {
-		return err
+		return fmt.Errorf("MongoDB ping failed: %v", err)
 	}
 	if err := s.createMongoDBIndexes(); err != nil {
-		return err
+		return fmt.Errorf("failed to create MongoDB indexes: %v", err)
 	}
 	log.Println("Connected to MongoDB")
 	return nil
@@ -1941,3 +1840,29 @@ func (s *Server) handleHistoryRequest(client *Client, chatID string, before int6
 	client.Send <- responseJSON
 }
 
+
+// ./setup.sh
+
+#!/bin/bash
+
+# Install dependencies
+echo "Installing dependencies..."
+go mod tidy
+
+# Build the application
+echo "Building the application..."
+go build -o chat-service .
+
+# Start Docker services
+echo "Starting Docker services..."
+docker-compose up -d
+
+# Check if Docker services are running
+echo "Checking Docker services..."
+docker-compose ps
+
+echo "Setup complete! The application is now running."
+echo "Service endpoints:"
+echo "- Chat service 1: http://localhost:8080"
+echo "- Chat service 2: http://localhost:8081"
+echo "- Load balancer: http://localhost:80"
