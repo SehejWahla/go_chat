@@ -240,6 +240,7 @@ func (s *Server) registerInstance() error {
 func (s *Server) RegisterRoutes(router *mux.Router) {
 	router.HandleFunc("/ws/chat", s.handleWebSocketConnection)
 	router.HandleFunc("/health", s.handleHealthCheck)
+	router.HandleFunc("/version", s.handleVersion).Methods("GET")
 }
 
 func (s *Server) handleWebSocketConnection(w http.ResponseWriter, r *http.Request) {
@@ -977,4 +978,13 @@ func (s *Server) handleHistoryRequest(client *Client, chatID string, before int6
 	})
 	responseJSON, _ := json.Marshal(historyResponse)
 	client.Send <- responseJSON
+}
+
+func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
+	version := map[string]string{
+		"version":    "1.0.0", // Change this for each test (e.g., "1.0.1")
+		"build_time": time.Now().Format(time.RFC3339),
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(version)
 }
