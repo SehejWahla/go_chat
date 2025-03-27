@@ -1,0 +1,728 @@
+ aws ecr create-repository --repository-name wobichat/chat-service --region ap-southeast-2
+{
+    "repository": {
+        "repositoryArn": "arn:aws:ecr:ap-southeast-2:754590379920:repository/wobichat/chat-service",
+        "registryId": "754590379920",
+        "repositoryName": "wobichat/chat-service",
+        "repositoryUri": "754590379920.dkr.ecr.ap-southeast-2.amazonaws.com/wobichat/chat-service",
+        "createdAt": "2025-03-27T11:49:36.067000+11:00",
+        "imageTagMutability": "MUTABLE",
+        "imageScanningConfiguration": {
+            "scanOnPush": false
+        },
+        "encryptionConfiguration": {
+            "encryptionType": "AES256"
+        }
+    }
+}
+
+- - - - - - - - - - - - - -
+
+aws ecr get-login-password --region ap-southeast-2 | docker login --username AWS --password-stdin 754590379920.dkr.ecr.ap-southeast-2.amazonaws.com
+Login Succeeded
+
+- - - - - - - - - - - - - -
+
+docker build --platform linux/amd64 -t wobichat/chat-service .
+[+] Building 105.6s (16/16) FINISHED                                                              docker:desktop-linux
+ => [internal] load build definition from Dockerfile                                                              0.0s
+ => => transferring dockerfile: 595B                                                                              0.0s
+ => [internal] load metadata for docker.io/library/golang:1.19                                                    2.7s
+ => [internal] load .dockerignore                                                                                 0.0s
+ => => transferring context: 2B                                                                                   0.0s
+ => [internal] load build context                                                                                 0.0s
+ => => transferring context: 32.22kB                                                                              0.0s
+ => [builder 1/7] FROM docker.io/library/golang:1.19@sha256:3025bf670b8363ec9f1b4c4f27348e6d9b7fec607c47e401e40  35.9s
+ => => resolve docker.io/library/golang:1.19@sha256:3025bf670b8363ec9f1b4c4f27348e6d9b7fec607c47e401e40df816853e  0.0s
+ => => sha256:0808c64687902329ac64331848304f6f0bc14b86d6be46bccf79292b564f6587 149.14MB / 149.14MB               16.8s
+ => => sha256:5ec11cb68eac452710eadb46df5e6cf6ead699755303758bf1e262e47b013417 155B / 155B                        0.3s
+ => => sha256:190fa1651026077cee00b53a754acbe0dc734b99255c6b274e798f6cd877ae18 92.27MB / 92.27MB                 32.4s
+ => => sha256:9f13f5a53d118643c1f1ff294867c09f224d00edca21f56caa71c2321f8ca004 64.11MB / 64.11MB                 26.5s
+ => => sha256:00046d1e755ea94fa55a700ca9a10597e4fac7c47be19d970a359b0267a51fbf 24.03MB / 24.03MB                 17.9s
+ => => sha256:012c0b3e998c1a0c0bedcf712eaaafb188580529dd026a04aa1ce13fdb39e42b 49.56MB / 49.56MB                  9.7s
+ => => extracting sha256:012c0b3e998c1a0c0bedcf712eaaafb188580529dd026a04aa1ce13fdb39e42b                         0.6s
+ => => extracting sha256:00046d1e755ea94fa55a700ca9a10597e4fac7c47be19d970a359b0267a51fbf                         0.2s
+ => => extracting sha256:9f13f5a53d118643c1f1ff294867c09f224d00edca21f56caa71c2321f8ca004                         1.0s
+ => => extracting sha256:190fa1651026077cee00b53a754acbe0dc734b99255c6b274e798f6cd877ae18                         1.0s
+ => => extracting sha256:0808c64687902329ac64331848304f6f0bc14b86d6be46bccf79292b564f6587                         2.4s
+ => => extracting sha256:5ec11cb68eac452710eadb46df5e6cf6ead699755303758bf1e262e47b013417                         0.0s
+ => [builder 2/7] RUN apt-get update && apt-get install -y     build-essential     bash     git     openssh-cli  13.2s
+ => [stage-1 2/5] RUN apt-get update && apt-get install -y     librdkafka1     ca-certificates                    5.3s
+ => [stage-1 3/5] WORKDIR /app                                                                                    0.0s
+ => [builder 3/7] WORKDIR /app                                                                                    0.0s
+ => [builder 4/7] COPY go.mod go.sum ./                                                                           0.0s
+ => [builder 5/7] RUN go mod download                                                                            14.8s
+ => [builder 6/7] COPY *.go ./                                                                                    0.0s
+ => [builder 7/7] RUN go build -o chat-service .                                                                 38.0s
+ => [stage-1 4/5] COPY --from=builder /app/chat-service .                                                         0.0s
+ => [stage-1 5/5] COPY .env .                                                                                     0.0s
+ => exporting to image                                                                                            0.8s
+ => => exporting layers                                                                                           0.7s
+ => => exporting manifest sha256:1038df9adc4f32ae2edc8f9c67288d7a5777c4a392c410f721f31e7889cc7c86                 0.0s
+ => => exporting config sha256:dce4cf7dd3b92c52f9c806bdb3d86f57e5a516d942d809fc542f99f0eace1445                   0.0s
+ => => exporting attestation manifest sha256:28f19be2fa05dfea442e087741631880529409f92a294b76330dd6cd78d77f6e     0.0s
+ => => exporting manifest list sha256:7e8fd0161fda62f54a75e5ed80dab0a1cbe8aa6f284f281eb90fcd5ce7184161            0.0s
+ => => naming to docker.io/wobichat/chat-service:latest       
+
+ - - - - - - - - - - - - - -
+
+docker tag wobichat/chat-service:latest 754590379920.dkr.ecr.ap-southeast-2.amazonaws.com/wobichat/chat-service:latest
+
+ - - - - - - - - - - - - - -
+
+docker push 754590379920.dkr.ecr.ap-southeast-2.amazonaws.com/wobichat/chat-service:latest
+The push refers to repository [754590379920.dkr.ecr.ap-southeast-2.amazonaws.com/wobichat/chat-service]
+df982154e812: Pushed 
+436775f2483e: Pushed 
+d4db119ba6d6: Pushed 
+0808c6468790: Pushed 
+5ec11cb68eac: Pushed 
+00046d1e755e: Pushed 
+9f13f5a53d11: Pushed 
+190fa1651026: Pushed 
+409d6f24fe23: Pushed 
+012c0b3e998c: Pushed 
+1f615e65bc4c: Pushed 
+latest: digest: sha256:7e8fd0161fda62f54a75e5ed80dab0a1cbe8aa6f284f281eb90fcd5ce7184161 size: 856
+
+ - - - - - - - - - - - - - -
+
+aws ec2 create-vpc --cidr-block 10.0.0.0/16 --region ap-southeast-2
+{
+    "Vpc": {
+        "OwnerId": "754590379920",
+        "InstanceTenancy": "default",
+        "Ipv6CidrBlockAssociationSet": [],
+        "CidrBlockAssociationSet": [
+            {
+                "AssociationId": "vpc-cidr-assoc-0951bc8d305e3c56b",
+                "CidrBlock": "10.0.0.0/16",
+                "CidrBlockState": {
+                    "State": "associated"
+                }
+            }
+        ],
+        "IsDefault": false,
+        "VpcId": "vpc-0fa102ab754020643",
+        "State": "pending",
+        "CidrBlock": "10.0.0.0/16",
+        "DhcpOptionsId": "dopt-0328eca5298d3437c"
+    }
+}
+
+ - - - - - - - - - - - - - -
+
+
+aws ec2 create-subnet --vpc-id vpc-0fa102ab754020643 --cidr-block 10.0.1.0/24 --availability-zone ap-southeast-2a
+{
+    "Subnet": {
+        "AvailabilityZoneId": "apse2-az1",
+        "OwnerId": "754590379920",
+        "AssignIpv6AddressOnCreation": false,
+        "Ipv6CidrBlockAssociationSet": [],
+        "SubnetArn": "arn:aws:ec2:ap-southeast-2:754590379920:subnet/subnet-019671d5da6c15799",
+        "EnableDns64": false,
+        "Ipv6Native": false,
+        "PrivateDnsNameOptionsOnLaunch": {
+            "HostnameType": "ip-name",
+            "EnableResourceNameDnsARecord": false,
+            "EnableResourceNameDnsAAAARecord": false
+        },
+        "SubnetId": "subnet-019671d5da6c15799",
+        "State": "available",
+        "VpcId": "vpc-0fa102ab754020643",
+        "CidrBlock": "10.0.1.0/24",
+        "AvailableIpAddressCount": 251,
+        "AvailabilityZone": "ap-southeast-2a",
+        "DefaultForAz": false,
+        "MapPublicIpOnLaunch": false
+    }
+}
+
+aws ec2 create-subnet --vpc-id vpc-0fa102ab754020643 --cidr-block 10.0.2.0/24 --availability-zone ap-southeast-2b
+
+{
+    "Subnet": {
+        "AvailabilityZoneId": "apse2-az3",
+        "OwnerId": "754590379920",
+        "AssignIpv6AddressOnCreation": false,
+        "Ipv6CidrBlockAssociationSet": [],
+        "SubnetArn": "arn:aws:ec2:ap-southeast-2:754590379920:subnet/subnet-0f43da2d7726437b1",
+        "EnableDns64": false,
+        "Ipv6Native": false,
+        "PrivateDnsNameOptionsOnLaunch": {
+            "HostnameType": "ip-name",
+            "EnableResourceNameDnsARecord": false,
+            "EnableResourceNameDnsAAAARecord": false
+        },
+        "SubnetId": "subnet-0f43da2d7726437b1",
+        "State": "available",
+        "VpcId": "vpc-0fa102ab754020643",
+        "CidrBlock": "10.0.2.0/24",
+        "AvailableIpAddressCount": 251,
+        "AvailabilityZone": "ap-southeast-2b",
+        "DefaultForAz": false,
+        "MapPublicIpOnLaunch": false
+    }
+}
+
+ - - - - - - - - - - - - - -
+
+aws ec2 create-internet-gateway --region ap-southeast-2
+{
+    "InternetGateway": {
+        "Attachments": [],
+        "InternetGatewayId": "igw-05ae04d6d69b8dd15",
+        "OwnerId": "754590379920",
+        "Tags": []
+    }
+}
+
+ - - - - - - - - - - - - - -
+
+aws ec2 attach-internet-gateway --vpc-id vpc-0fa102ab754020643 --internet-gateway-id igw-05ae04d6d69b8dd15 --region ap-southeast-2
+
+ - - - - - - - - - - - - - -
+
+aws ec2 create-route-table --vpc-id vpc-0fa102ab754020643 --region ap-southeast-2
+
+{
+    "RouteTable": {
+        "Associations": [],
+        "PropagatingVgws": [],
+        "RouteTableId": "rtb-0fc321adebf3fabcf",
+        "Routes": [
+            {
+                "DestinationCidrBlock": "10.0.0.0/16",
+                "GatewayId": "local",
+                "Origin": "CreateRouteTable",
+                "State": "active"
+            }
+        ],
+        "Tags": [],
+        "VpcId": "vpc-0fa102ab754020643",
+        "OwnerId": "754590379920"
+    },
+    "ClientToken": "7006b954-ae8a-42a1-b21f-a8bd61c315cf"
+}
+
+ - - - - - - - - - - - - - -
+ 
+aws ec2 create-route --route-table-id rtb-0fc321adebf3fabcf --destination-cidr-block 0.0.0.0/0 --gateway-id igw-05ae04d6d69b8dd15 --region ap-southeast-2
+
+{
+    "Return": true
+}
+
+ - - - - - - - - - - - - - -
+
+aws ec2 associate-route-table --subnet-id subnet-019671d5da6c15799 --route-table-id rtb-0fc321adebf3fabcf --region ap-southeast-2
+
+{
+    "AssociationId": "rtbassoc-0201f829f468e84bb",
+    "AssociationState": {
+        "State": "associated"
+    }
+}
+
+aws ec2 associate-route-table --subnet-id subnet-0f43da2d7726437b1 --route-table-id rtb-0fc321adebf3fabcf --region ap-southeast-2
+{
+    "AssociationId": "rtbassoc-0072e80d30667670f",
+    "AssociationState": {
+        "State": "associated"
+    }
+}
+
+ - - - - - - - - - - - - - -
+
+aws ec2 modify-subnet-attribute --subnet-id subnet-019671d5da6c15799 --map-public-ip-on-launch --region ap-southeast-2
+aws ec2 modify-subnet-attribute --subnet-id subnet-0f43da2d7726437b1 --map-public-ip-on-launch --region ap-southeast-2
+
+ - - - - - - - - - - - - - -
+
+aws ec2 create-security-group --group-name wobichat-sg --description "Security group for wobichat" --vpc-id vpc-0fa102ab754020643 --region ap-southeast-2
+{
+    "GroupId": "sg-0833af37da18f7271",
+    "SecurityGroupArn": "arn:aws:ec2:ap-southeast-2:754590379920:security-group/sg-0833af37da18f7271"
+}
+
+ - - - - - - - - - - - - - -
+
+aws ec2 authorize-security-group-ingress --group-id sg-0833af37da18f7271 --protocol tcp --port 8080 --cidr 0.0.0.0/0 --region ap-southeast-2
+{
+    "Return": true,
+    "SecurityGroupRules": [
+        {
+            "SecurityGroupRuleId": "sgr-01639b254d0fed3bb",
+            "GroupId": "sg-0833af37da18f7271",
+            "GroupOwnerId": "754590379920",
+            "IsEgress": false,
+            "IpProtocol": "tcp",
+            "FromPort": 8080,
+            "ToPort": 8080,
+            "CidrIpv4": "0.0.0.0/0",
+            "SecurityGroupRuleArn": "arn:aws:ec2:ap-southeast-2:754590379920:security-group-rule/sgr-01639b254d0fed3bb"
+        }
+    ]
+}
+
+ - - - - - - - - - - - - - -
+
+aws ecs create-cluster --cluster-name wobichat-cluster --region ap-southeast-2
+{
+    "cluster": {
+        "clusterArn": "arn:aws:ecs:ap-southeast-2:754590379920:cluster/wobichat-cluster",
+        "clusterName": "wobichat-cluster",
+        "status": "ACTIVE",
+        "registeredContainerInstancesCount": 0,
+        "runningTasksCount": 0,
+        "pendingTasksCount": 0,
+        "activeServicesCount": 0,
+        "statistics": [],
+        "tags": [],
+        "settings": [
+            {
+                "name": "containerInsights",
+                "value": "disabled"
+            }
+        ],
+        "capacityProviders": [],
+        "defaultCapacityProviderStrategy": []
+    }
+}
+
+ - - - - - - - - - - - - - -
+
+aws logs create-log-group --log-group-name /ecs/wobichat --region ap-southeast-2
+
+ - - - - - - - - - - - - - -
+
+
+aws ecs register-task-definition --cli-input-json file://wobichat-task.json --region ap-southeast-2
+{
+    "taskDefinition": {
+        "taskDefinitionArn": "arn:aws:ecs:ap-southeast-2:754590379920:task-definition/wobichat-task:1",
+        "containerDefinitions": [
+            {
+                "name": "chat-service",
+                "image": "754590379920.dkr.ecr.ap-southeast-2.amazonaws.com/wobichat/chat-service:latest",
+                "cpu": 0,
+                "portMappings": [
+                    {
+                        "containerPort": 8080,
+                        "hostPort": 8080,
+                        "protocol": "tcp"
+                    }
+                ],
+                "essential": true,
+                "environment": [
+                    {
+                        "name": "KAFKA_BOOTSTRAP_SERVERS",
+                        "value": "pkc-921jm.us-east-2.aws.confluent.cloud:9092"
+                    },
+                    {
+                        "name": "KAFKA_API_SECRET",
+                        "value": "fEdbPtUfESqBhNjIecbIphJbTNz9Y3kQlGoKe+Av3aLG0p/zMXdzuhpAkiwifWK7"
+                    },
+                    {
+                        "name": "REDIS_HOST",
+                        "value": "redis-16702.c124.us-central1-1.gce.redns.redis-cloud.com"
+                    },
+                    {
+                        "name": "REDIS_PORT",
+                        "value": "16702"
+                    },
+                    {
+                        "name": "PORT",
+                        "value": "8080"
+                    },
+                    {
+                        "name": "KAFKA_API_KEY",
+                        "value": "JUHXV3WXBZE4XCJ6"
+                    },
+                    {
+                        "name": "MONGO_URI",
+                        "value": "mongodb+srv://sehej:Passw0rd942@wobitech.n7ilc.mongodb.net/wobichat-db?retryWrites=true&w=majority&appName=wobitech"
+                    },
+                    {
+                        "name": "REDIS_PASSWORD",
+                        "value": "C9vQpbNP9YqVj1OeHmXTpCxlDKk4TxA0"
+                    },
+                    {
+                        "name": "REDIS_USERNAME",
+                        "value": "default"
+                    }
+                ],
+                "mountPoints": [],
+                "volumesFrom": [],
+                "logConfiguration": {
+                    "logDriver": "awslogs",
+                    "options": {
+                        "awslogs-group": "/ecs/wobichat",
+                        "awslogs-region": "ap-southeast-2",
+                        "awslogs-stream-prefix": "chat-service"
+                    }
+                },
+                "systemControls": []
+            }
+        ],
+        "family": "wobichat-task",
+        "executionRoleArn": "arn:aws:iam::754590379920:role/ecsTaskExecutionRole",
+        "networkMode": "awsvpc",
+        "revision": 1,
+        "volumes": [],
+        "status": "ACTIVE",
+        "requiresAttributes": [
+            {
+                "name": "com.amazonaws.ecs.capability.logging-driver.awslogs"
+            },
+            {
+                "name": "ecs.capability.execution-role-awslogs"
+            },
+            {
+                "name": "com.amazonaws.ecs.capability.ecr-auth"
+            },
+            {
+                "name": "com.amazonaws.ecs.capability.docker-remote-api.1.19"
+            },
+            {
+                "name": "ecs.capability.execution-role-ecr-pull"
+            },
+            {
+                "name": "com.amazonaws.ecs.capability.docker-remote-api.1.18"
+            },
+            {
+                "name": "ecs.capability.task-eni"
+            }
+        ],
+        "placementConstraints": [],
+        "compatibilities": [
+            "EC2",
+            "FARGATE"
+        ],
+        "requiresCompatibilities": [
+            "FARGATE"
+        ],
+        "cpu": "512",
+        "memory": "1024",
+        "registeredAt": "2025-03-27T12:17:52.080000+11:00",
+        "registeredBy": "arn:aws:iam::754590379920:user/cli-user"
+    }
+}
+
+ - - - - - - - - - - - - - -
+
+aws elbv2 create-target-group --name wobichat-tg --protocol HTTP --port 8080 --vpc-id vpc-0fa102ab754020643 --target-type ip --region ap-southeast-2
+
+{
+    "TargetGroups": [
+        {
+            "TargetGroupArn": "arn:aws:elasticloadbalancing:ap-southeast-2:754590379920:targetgroup/wobichat-tg/3138a14ffd6555a8",
+            "TargetGroupName": "wobichat-tg",
+            "Protocol": "HTTP",
+            "Port": 8080,
+            "VpcId": "vpc-0fa102ab754020643",
+            "HealthCheckProtocol": "HTTP",
+            "HealthCheckPort": "traffic-port",
+            "HealthCheckEnabled": true,
+            "HealthCheckIntervalSeconds": 30,
+            "HealthCheckTimeoutSeconds": 5,
+            "HealthyThresholdCount": 5,
+            "UnhealthyThresholdCount": 2,
+            "HealthCheckPath": "/",
+            "Matcher": {
+                "HttpCode": "200"
+            },
+            "TargetType": "ip",
+            "ProtocolVersion": "HTTP1",
+            "IpAddressType": "ipv4"
+        }
+    ]
+}
+
+ - - - - - - - - - - - - - -
+
+aws elbv2 modify-target-group --target-group-arn arn:aws:elasticloadbalancing:ap-southeast-2:754590379920:targetgroup/wobichat-tg/3138a14ffd6555a8 --health-check-path /health --region ap-southeast-2
+
+{
+    "TargetGroups": [
+        {
+            "TargetGroupArn": "arn:aws:elasticloadbalancing:ap-southeast-2:754590379920:targetgroup/wobichat-tg/3138a14ffd6555a8",
+            "TargetGroupName": "wobichat-tg",
+            "Protocol": "HTTP",
+            "Port": 8080,
+            "VpcId": "vpc-0fa102ab754020643",
+            "HealthCheckProtocol": "HTTP",
+            "HealthCheckPort": "traffic-port",
+            "HealthCheckEnabled": true,
+            "HealthCheckIntervalSeconds": 30,
+            "HealthCheckTimeoutSeconds": 5,
+            "HealthyThresholdCount": 5,
+            "UnhealthyThresholdCount": 2,
+            "HealthCheckPath": "/health",
+            "Matcher": {
+                "HttpCode": "200"
+            },
+            "LoadBalancerArns": [],
+            "TargetType": "ip",
+            "ProtocolVersion": "HTTP1",
+            "IpAddressType": "ipv4"
+        }
+    ]
+}
+ - - - - - - - - - - - - - -
+
+aws elbv2 create-load-balancer --name wobichat-alb --subnets subnet-019671d5da6c15799 subnet-0f43da2d7726437b1 --security-groups sg-0833af37da18f7271 --scheme internet-facing --region ap-southeast-2
+{
+    "LoadBalancers": [
+        {
+            "LoadBalancerArn": "arn:aws:elasticloadbalancing:ap-southeast-2:754590379920:loadbalancer/app/wobichat-alb/8ca543762759298f",
+            "DNSName": "wobichat-alb-391697736.ap-southeast-2.elb.amazonaws.com",
+            "CanonicalHostedZoneId": "Z1GM3OXH4ZPM65",
+            "CreatedTime": "2025-03-27T01:35:58.200000+00:00",
+            "LoadBalancerName": "wobichat-alb",
+            "Scheme": "internet-facing",
+            "VpcId": "vpc-0fa102ab754020643",
+            "State": {
+                "Code": "provisioning"
+            },
+            "Type": "application",
+            "AvailabilityZones": [
+                {
+                    "ZoneName": "ap-southeast-2b",
+                    "SubnetId": "subnet-0f43da2d7726437b1",
+                    "LoadBalancerAddresses": []
+                },
+                {
+                    "ZoneName": "ap-southeast-2a",
+                    "SubnetId": "subnet-019671d5da6c15799",
+                    "LoadBalancerAddresses": []
+                }
+            ],
+            "SecurityGroups": [
+                "sg-0833af37da18f7271"
+            ],
+            "IpAddressType": "ipv4"
+        }
+    ]
+}
+
+ - - - - - - - - - - - - - -
+
+aws elbv2 create-listener --load-balancer-arn arn:aws:elasticloadbalancing:ap-southeast-2:754590379920:loadbalancer/app/wobichat-alb/8ca543762759298f --protocol HTTP --port 80 --default-actions Type=forward,TargetGroupArn=arn:aws:elasticloadbalancing:ap-southeast-2:754590379920:targetgroup/wobichat-tg/3138a14ffd6555a8 --region ap-southeast-2
+{
+    "Listeners": [
+        {
+            "ListenerArn": "arn:aws:elasticloadbalancing:ap-southeast-2:754590379920:listener/app/wobichat-alb/8ca543762759298f/c3724d4f7ea18974",
+            "LoadBalancerArn": "arn:aws:elasticloadbalancing:ap-southeast-2:754590379920:loadbalancer/app/wobichat-alb/8ca543762759298f",
+            "Port": 80,
+            "Protocol": "HTTP",
+            "DefaultActions": [
+                {
+                    "Type": "forward",
+                    "TargetGroupArn": "arn:aws:elasticloadbalancing:ap-southeast-2:754590379920:targetgroup/wobichat-tg/3138a14ffd6555a8",
+                    "ForwardConfig": {
+                        "TargetGroups": [
+                            {
+                                "TargetGroupArn": "arn:aws:elasticloadbalancing:ap-southeast-2:754590379920:targetgroup/wobichat-tg/3138a14ffd6555a8",
+                                "Weight": 1
+                            }
+                        ],
+                        "TargetGroupStickinessConfig": {
+                            "Enabled": false
+                        }
+                    }
+                }
+            ]
+        }
+    ]
+}
+
+ - - - - - - - - - - - - - -
+
+aws elbv2 modify-load-balancer-attributes --load-balancer-arn arn:aws:elasticloadbalancing:ap-southeast-2:754590379920:loadbalancer/app/wobichat-alb/8ca543762759298f --attributes Key=idle_timeout.timeout_seconds,Value=3600 --region ap-southeast-2
+{
+    "Attributes": [
+        {
+            "Key": "idle_timeout.timeout_seconds",
+            "Value": "3600"
+        },
+        {
+            "Key": "access_logs.s3.enabled",
+            "Value": "false"
+        },
+        {
+            "Key": "access_logs.s3.bucket",
+            "Value": ""
+        },
+        {
+            "Key": "access_logs.s3.prefix",
+            "Value": ""
+        },
+        {
+            "Key": "deletion_protection.enabled",
+            "Value": "false"
+        },
+        {
+            "Key": "routing.http2.enabled",
+            "Value": "true"
+        },
+        {
+            "Key": "routing.http.drop_invalid_header_fields.enabled",
+            "Value": "false"
+        },
+        {
+            "Key": "routing.http.xff_client_port.enabled",
+            "Value": "false"
+        },
+        {
+            "Key": "routing.http.preserve_host_header.enabled",
+            "Value": "false"
+        },
+        {
+            "Key": "routing.http.xff_header_processing.mode",
+            "Value": "append"
+        },
+        {
+            "Key": "load_balancing.cross_zone.enabled",
+            "Value": "true"
+        },
+        {
+            "Key": "routing.http.desync_mitigation_mode",
+            "Value": "defensive"
+        },
+        {
+            "Key": "client_keep_alive.seconds",
+            "Value": "3600"
+        },
+        {
+            "Key": "waf.fail_open.enabled",
+            "Value": "false"
+        },
+        {
+            "Key": "routing.http.x_amzn_tls_version_and_cipher_suite.enabled",
+            "Value": "false"
+        },
+        {
+            "Key": "zonal_shift.config.enabled",
+            "Value": "false"
+        },
+        {
+            "Key": "connection_logs.s3.enabled",
+            "Value": "false"
+        },
+        {
+            "Key": "connection_logs.s3.bucket",
+            "Value": ""
+        },
+        {
+            "Key": "connection_logs.s3.prefix",
+            "Value": ""
+        }
+    ]
+}
+
+ - - - - - - - - - - - - - -
+
+ aws ecs create-service \
+  --cluster wobichat-cluster \
+  --service-name wobichat-service \
+  --task-definition wobichat-task:1 \
+  --desired-count 2 \
+  --launch-type FARGATE \
+  --network-configuration "awsvpcConfiguration={subnets=[subnet-019671d5da6c15799,subnet-0f43da2d7726437b1],securityGroups=[sg-0833af37da18f7271],assignPublicIp=ENABLED}" \
+  --load-balancers "targetGroupArn=arn:aws:elasticloadbalancing:ap-southeast-2:754590379920:targetgroup/wobichat-tg/3138a14ffd6555a8,containerName=chat-service,containerPort=8080" \
+  --region ap-southeast-2
+{
+    "service": {
+        "serviceArn": "arn:aws:ecs:ap-southeast-2:754590379920:service/wobichat-cluster/wobichat-service",
+        "serviceName": "wobichat-service",
+        "clusterArn": "arn:aws:ecs:ap-southeast-2:754590379920:cluster/wobichat-cluster",
+        "loadBalancers": [
+            {
+                "targetGroupArn": "arn:aws:elasticloadbalancing:ap-southeast-2:754590379920:targetgroup/wobichat-tg/3138a14ffd6555a8",
+                "containerName": "chat-service",
+                "containerPort": 8080
+            }
+        ],
+        "serviceRegistries": [],
+        "status": "ACTIVE",
+        "desiredCount": 2,
+        "runningCount": 0,
+        "pendingCount": 0,
+        "launchType": "FARGATE",
+        "platformVersion": "LATEST",
+        "platformFamily": "Linux",
+        "taskDefinition": "arn:aws:ecs:ap-southeast-2:754590379920:task-definition/wobichat-task:1",
+        "deploymentConfiguration": {
+            "deploymentCircuitBreaker": {
+                "enable": false,
+                "rollback": false
+            },
+            "maximumPercent": 200,
+            "minimumHealthyPercent": 100
+        },
+        "deployments": [
+            {
+                "id": "ecs-svc/4714805601015776308",
+                "status": "PRIMARY",
+                "taskDefinition": "arn:aws:ecs:ap-southeast-2:754590379920:task-definition/wobichat-task:1",
+                "desiredCount": 0,
+                "pendingCount": 0,
+                "runningCount": 0,
+                "failedTasks": 0,
+                "createdAt": "2025-03-27T12:44:00.906000+11:00",
+                "updatedAt": "2025-03-27T12:44:00.906000+11:00",
+                "launchType": "FARGATE",
+                "platformVersion": "1.4.0",
+                "platformFamily": "Linux",
+                "networkConfiguration": {
+                    "awsvpcConfiguration": {
+                        "subnets": [
+                            "subnet-0f43da2d7726437b1",
+                            "subnet-019671d5da6c15799"
+                        ],
+                        "securityGroups": [
+                            "sg-0833af37da18f7271"
+                        ],
+                        "assignPublicIp": "ENABLED"
+                    }
+                },
+                "rolloutState": "IN_PROGRESS",
+                "rolloutStateReason": "ECS deployment ecs-svc/4714805601015776308 in progress."
+            }
+        ],
+        "roleArn": "arn:aws:iam::754590379920:role/aws-service-role/ecs.amazonaws.com/AWSServiceRoleForECS",
+        "events": [],
+        "createdAt": "2025-03-27T12:44:00.906000+11:00",
+        "placementConstraints": [],
+        "placementStrategy": [],
+        "networkConfiguration": {
+            "awsvpcConfiguration": {
+                "subnets": [
+                    "subnet-0f43da2d7726437b1",
+                    "subnet-019671d5da6c15799"
+                ],
+                "securityGroups": [
+                    "sg-0833af37da18f7271"
+                ],
+                "assignPublicIp": "ENABLED"
+            }
+        },
+        "healthCheckGracePeriodSeconds": 0,
+        "schedulingStrategy": "REPLICA",
+        "deploymentController": {
+            "type": "ECS"
+        },
+        "createdBy": "arn:aws:iam::754590379920:user/cli-user",
+        "enableECSManagedTags": false,
+        "propagateTags": "NONE",
+        "enableExecuteCommand": false,
+        "availabilityZoneRebalancing": "DISABLED"
+    }
+}
+
+ - - - - - - - - - - - - - -
+
+aws elbv2 describe-load-balancers --load-balancer-arns arn:aws:elasticloadbalancing:ap-southeast-2:754590379920:loadbalancer/app/wobichat-alb/8ca543762759298f --region ap-southeast-2 --query 'LoadBalancers[0].DNSName' --output text
+wobichat-alb-391697736.ap-southeast-2.elb.amazonaws.com

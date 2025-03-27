@@ -1,0 +1,66 @@
+{
+    "family": "wobichat-task",
+    "networkMode": "awsvpc",
+    "requiresCompatibilities": ["FARGATE"],
+    "cpu": "512",
+    "memory": "1024",
+    "executionRoleArn": "arn:aws:iam::754590379920:role/ecsTaskExecutionRole",
+    "containerDefinitions": [
+      {
+        "name": "chat-service",
+        "image": "754590379920.dkr.ecr.ap-southeast-2.amazonaws.com/wobichat/chat-service:latest",
+        "portMappings": [
+          {
+            "containerPort": 8080,
+            "protocol": "tcp"
+          }
+        ],
+        "environment": [
+          {
+            "name": "KAFKA_BOOTSTRAP_SERVERS",
+            "value": "pkc-921jm.us-east-2.aws.confluent.cloud:9092"
+          },
+          {
+            "name": "KAFKA_API_KEY",
+            "value": "JUHXV3WXBZE4XCJ6"
+          },
+          {
+            "name": "KAFKA_API_SECRET",
+            "value": "fEdbPtUfESqBhNjIecbIphJbTNz9Y3kQlGoKe+Av3aLG0p/zMXdzuhpAkiwifWK7"
+          },
+          {
+            "name": "REDIS_HOST",
+            "value": "redis-16702.c124.us-central1-1.gce.redns.redis-cloud.com"
+          },
+          {
+            "name": "REDIS_PORT",
+            "value": "16702"
+          },
+          {
+            "name": "REDIS_USERNAME",
+            "value": "default"
+          },
+          {
+            "name": "REDIS_PASSWORD",
+            "value": "C9vQpbNP9YqVj1OeHmXTpCxlDKk4TxA0"
+          },
+          {
+            "name": "MONGO_URI",
+            "value": "mongodb+srv://sehej:Passw0rd942@wobitech.n7ilc.mongodb.net/wobichat-db?retryWrites=true&w=majority&appName=wobitech"
+          },
+          {
+            "name": "PORT",
+            "value": "8080"
+          }
+        ],
+        "logConfiguration": {
+          "logDriver": "awslogs",
+          "options": {
+            "awslogs-group": "/ecs/wobichat",
+            "awslogs-region": "ap-southeast-2",
+            "awslogs-stream-prefix": "chat-service"
+          }
+        }
+      }
+    ]
+  }
