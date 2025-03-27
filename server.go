@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -17,6 +18,19 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
+
+func extractDatabaseFromURI(uri string) string {
+	lastSlash := strings.LastIndex(uri, "/")
+	if lastSlash == -1 {
+		return ""
+	}
+	uri = uri[lastSlash+1:]
+	questionMark := strings.Index(uri, "?")
+	if questionMark == -1 {
+		return uri
+	}
+	return uri[:questionMark]
+}
 
 type Server struct {
 	instanceID        string
@@ -34,6 +48,7 @@ type Server struct {
 	batchTicker       *time.Ticker
 	sequenceNumbers   map[string]int64
 	sequenceNumMutex  sync.Mutex
+	dbName            string
 }
 
 func NewServer() (*Server, error) {
@@ -119,6 +134,13 @@ func (s *Server) connectToMongoDB() error {
 	if mongoURI == "" {
 		return fmt.Errorf("MONGO_URI environment variable is not set")
 	}
+
+	dbName := extractDatabaseFromURI(mongoURI)
+	if dbName == "" {
+		return fmt.Errorf("no database name found in MONGO_URI")
+	}
+	s.dbName = dbName
+
 	clientOptions := options.Client().ApplyURI(mongoURI)
 	var err error
 	s.mongoClient, err = mongo.Connect(s.ctx, clientOptions)
@@ -136,7 +158,7 @@ func (s *Server) connectToMongoDB() error {
 }
 
 func (s *Server) createMongoDBIndexes() error {
-	messagesCollection := s.mongoClient.Database("chat").Collection("messages")
+	messagesCollection := s.mongoClient.Database(s.dbName).Collection("messages")
 	_, err := messagesCollection.Indexes().CreateOne(s.ctx, mongo.IndexModel{
 		Keys: bson.D{{Key: "to", Value: 1}, {Key: "timestamp", Value: -1}},
 	})
@@ -264,7 +286,7 @@ func (s *Server) handleWebSocketConnection(w http.ResponseWriter, r *http.Reques
 }
 
 func (s *Server) deliverPendingMessages(client *Client) {
-	collection := s.mongoClient.Database("chat").Collection("pending_messages")
+	collection := s.mongoClient.Database(s.dbName).Collection("pending_messages")
 	filter := bson.M{"to": client.UserID}
 	cursor, err := collection.Find(s.ctx, filter, options.Find().SetSort(bson.D{{Key: "timestamp", Value: 1}}))
 	if err != nil {
@@ -341,7 +363,7 @@ func (s *Server) updateConnectionInfo(connInfo UserConnection) {
 }
 
 func (s *Server) loadUserGroups(client *Client) {
-	collection := s.mongoClient.Database("chat").Collection("user_groups")
+	collection := s.mongoClient.Database(s.dbName).Collection("user_groups")
 	var result struct {
 		UserID string   `bson:"user_id"`
 		Groups []string `bson:"groups"`
@@ -402,7 +424,7 @@ func (s *Server) routeDirectMessage(message MessagePacket) {
 }
 
 func (s *Server) storePendingMessage(message MessagePacket) {
-	collection := s.mongoClient.Database("chat").Collection("pending_messages")
+	collection := s.mongoClient.Database(s.dbName).Collection("pending_messages")
 	message.Status = "pending"
 	_, err := collection.InsertOne(s.ctx, message)
 	if err != nil {
@@ -427,7 +449,7 @@ func (s *Server) sendMessageAck(messageID, fromUserID, toUserID, status string) 
 	})
 
 	if toUserID == "" {
-		collection := s.mongoClient.Database("chat").Collection("messages")
+		collection := s.mongoClient.Database(s.dbName).Collection("messages")
 		var message MessagePacket
 		err := collection.FindOne(s.ctx, bson.M{"id": messageID}).Decode(&message)
 		if err != nil {
@@ -468,7 +490,7 @@ func (s *Server) processAcknowledgment(messageID, fromUserID, status string) {
 		"user_id":    fromUserID,
 		"status":     status,
 	})
-	collection := s.mongoClient.Database("chat").Collection("messages")
+	collection := s.mongoClient.Database(s.dbName).Collection("messages")
 	var message MessagePacket
 	err := collection.FindOne(s.ctx, bson.M{"id": messageID}).Decode(&message)
 	if err != nil {
@@ -522,7 +544,7 @@ func (s *Server) handleClientGroupMessage(client *Client, groupID string, conten
 
 func (s *Server) routeGroupMessage(message MessagePacket) {
 	groupID := message.To
-	collection := s.mongoClient.Database("chat").Collection("groups")
+	collection := s.mongoClient.Database(s.dbName).Collection("groups")
 	var group GroupMetadata
 	err := collection.FindOne(s.ctx, bson.M{"_id": groupID}).Decode(&group)
 	if err != nil {
@@ -586,13 +608,13 @@ func (s *Server) handleCreateGroup(client *Client, name string, members []string
 		CreatedAt: time.Now(),
 		CreatedBy: client.UserID,
 	}
-	collection := s.mongoClient.Database("chat").Collection("groups")
+	collection := s.mongoClient.Database(s.dbName).Collection("groups")
 	_, err := collection.InsertOne(s.ctx, group)
 	if err != nil {
 		log.Printf("Error creating group: %v", err)
 		return
 	}
-	userGroupsCollection := s.mongoClient.Database("chat").Collection("user_groups")
+	userGroupsCollection := s.mongoClient.Database(s.dbName).Collection("user_groups")
 	for _, memberID := range members {
 		var userGroups struct {
 			UserID string   `bson:"user_id"`
@@ -679,13 +701,13 @@ func (s *Server) processBatch() {
 		}
 		switch collection {
 		case "messages":
-			messagesCollection := s.mongoClient.Database("chat").Collection("messages")
+			messagesCollection := s.mongoClient.Database(s.dbName).Collection("messages")
 			_, err := messagesCollection.InsertMany(s.ctx, documents)
 			if err != nil {
 				log.Printf("Error batch inserting messages: %v", err)
 			}
 		case "acks":
-			messagesCollection := s.mongoClient.Database("chat").Collection("messages")
+			messagesCollection := s.mongoClient.Database(s.dbName).Collection("messages")
 			for _, doc := range documents {
 				ack := doc.(map[string]interface{})
 				messageID := ack["message_id"].(string)
@@ -807,7 +829,7 @@ func (s *Server) routeDirectTypingIndicator(fromUserID, toUserID string, notific
 }
 
 func (s *Server) routeGroupTypingIndicator(fromUserID, groupID string, notification []byte) {
-	collection := s.mongoClient.Database("chat").Collection("groups")
+	collection := s.mongoClient.Database(s.dbName).Collection("groups")
 	var group GroupMetadata
 	err := collection.FindOne(s.ctx, bson.M{"_id": groupID}).Decode(&group)
 	if err != nil {
@@ -950,7 +972,7 @@ func (s *Server) handleHistoryRequest(client *Client, chatID string, before int6
 	}
 
 	// Query MongoDB
-	collection := s.mongoClient.Database("chat").Collection("messages")
+	collection := s.mongoClient.Database(s.dbName).Collection("messages")
 	opts := options.Find().SetSort(bson.D{{Key: "timestamp", Value: -1}}).SetLimit(int64(limit))
 	cursor, err := collection.Find(s.ctx, filter, opts)
 	if err != nil {
