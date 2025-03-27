@@ -1,5 +1,52 @@
-// ./env
+// ./deploy.yml
+name: Deploy to ECS
 
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v1
+
+      - name: Build Docker image
+        run: |
+          docker build --platform linux/amd64 -t wobichat/chat-service .
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-southeast-2  
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Tag and push image to Amazon ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: wobichat/chat-service
+          IMAGE_TAG: latest
+        run: |
+          docker tag wobichat/chat-service $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+      - name: Deploy to ECS
+        run: |
+          aws ecs update-service --cluster wobichat-cluster --service wobichat-service --force-new-deployment
+
+
+
+// ./env
 # Kafka Configuration (Confluent Cloud)
 KAFKA_BOOTSTRAP_SERVERS=pkc-921jm.us-east-2.aws.confluent.cloud:9092
 KAFKA_API_KEY=JUHXV3WXBZE4XCJ6
@@ -275,7 +322,6 @@ services:
       - SERVICE_INSTANCE_ID=instance-2
     restart: unless-stopped
 
-
 // ./Dockerfile
 FROM golang:1.19 AS builder
 
@@ -304,36 +350,6 @@ COPY --from=builder /app/chat-service .
 COPY .env .
 EXPOSE 8080
 CMD ["./chat-service"]
-
-// ./go.mod
-module chat-service-confluent
-
-go 1.21
-
-require (
-	github.com/confluentinc/confluent-kafka-go/v2 v2.8.0
-	github.com/go-redis/redis/v8 v8.11.5
-	github.com/google/uuid v1.6.0
-	github.com/gorilla/mux v1.8.1
-	github.com/gorilla/websocket v1.5.0
-	github.com/joho/godotenv v1.5.1
-	go.mongodb.org/mongo-driver v1.17.3
-)
-
-require (
-	github.com/cespare/xxhash/v2 v2.2.0 // indirect
-	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect
-	github.com/golang/snappy v0.0.4 // indirect
-	github.com/klauspost/compress v1.17.9 // indirect
-	github.com/montanaflynn/stats v0.7.1 // indirect
-	github.com/xdg-go/pbkdf2 v1.0.0 // indirect
-	github.com/xdg-go/scram v1.1.2 // indirect
-	github.com/xdg-go/stringprep v1.0.4 // indirect
-	github.com/youmark/pkcs8 v0.0.0-20240726163527-a2c0da244d78 // indirect
-	golang.org/x/crypto v0.27.0 // indirect
-	golang.org/x/sync v0.8.0 // indirect
-	golang.org/x/text v0.18.0 // indirect
-)
 
 
 // ./kafka_client.go
@@ -644,9 +660,7 @@ func (k *KafkaClient) Close() error {
 	return nil
 }
 
-
 // ./main.go
-
 package main
 
 import (
@@ -859,6 +873,7 @@ http {
 }
 
 // ./server.go
+
 package main
 
 import (
@@ -1101,6 +1116,7 @@ func (s *Server) registerInstance() error {
 func (s *Server) RegisterRoutes(router *mux.Router) {
 	router.HandleFunc("/ws/chat", s.handleWebSocketConnection)
 	router.HandleFunc("/health", s.handleHealthCheck)
+	router.HandleFunc("/version", s.handleVersion).Methods("GET")
 }
 
 func (s *Server) handleWebSocketConnection(w http.ResponseWriter, r *http.Request) {
@@ -1840,29 +1856,80 @@ func (s *Server) handleHistoryRequest(client *Client, chatID string, before int6
 	client.Send <- responseJSON
 }
 
+func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
+	version := map[string]string{
+		"version":    "1.0.0", // Change this for each test (e.g., "1.0.1")
+		"build_time": time.Now().Format(time.RFC3339),
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(version)
+}
 
-// ./setup.sh
 
-#!/bin/bash
-
-# Install dependencies
-echo "Installing dependencies..."
-go mod tidy
-
-# Build the application
-echo "Building the application..."
-go build -o chat-service .
-
-# Start Docker services
-echo "Starting Docker services..."
-docker-compose up -d
-
-# Check if Docker services are running
-echo "Checking Docker services..."
-docker-compose ps
-
-echo "Setup complete! The application is now running."
-echo "Service endpoints:"
-echo "- Chat service 1: http://localhost:8080"
-echo "- Chat service 2: http://localhost:8081"
-echo "- Load balancer: http://localhost:80"
+// ./wobichat-task.json
+{
+    "family": "wobichat-task",
+    "networkMode": "awsvpc",
+    "requiresCompatibilities": ["FARGATE"],
+    "cpu": "512",
+    "memory": "1024",
+    "executionRoleArn": "arn:aws:iam::754590379920:role/ecsTaskExecutionRole",
+    "containerDefinitions": [
+      {
+        "name": "chat-service",
+        "image": "754590379920.dkr.ecr.ap-southeast-2.amazonaws.com/wobichat/chat-service:latest",
+        "portMappings": [
+          {
+            "containerPort": 8080,
+            "protocol": "tcp"
+          }
+        ],
+        "environment": [
+          {
+            "name": "KAFKA_BOOTSTRAP_SERVERS",
+            "value": "pkc-921jm.us-east-2.aws.confluent.cloud:9092"
+          },
+          {
+            "name": "KAFKA_API_KEY",
+            "value": "JUHXV3WXBZE4XCJ6"
+          },
+          {
+            "name": "KAFKA_API_SECRET",
+            "value": "fEdbPtUfESqBhNjIecbIphJbTNz9Y3kQlGoKe+Av3aLG0p/zMXdzuhpAkiwifWK7"
+          },
+          {
+            "name": "REDIS_HOST",
+            "value": "redis-16702.c124.us-central1-1.gce.redns.redis-cloud.com"
+          },
+          {
+            "name": "REDIS_PORT",
+            "value": "16702"
+          },
+          {
+            "name": "REDIS_USERNAME",
+            "value": "default"
+          },
+          {
+            "name": "REDIS_PASSWORD",
+            "value": "C9vQpbNP9YqVj1OeHmXTpCxlDKk4TxA0"
+          },
+          {
+            "name": "MONGO_URI",
+            "value": "mongodb+srv://sehej:Passw0rd942@wobitech.n7ilc.mongodb.net/wobichat-db?retryWrites=true&w=majority&appName=wobitech"
+          },
+          {
+            "name": "PORT",
+            "value": "8080"
+          }
+        ],
+        "logConfiguration": {
+          "logDriver": "awslogs",
+          "options": {
+            "awslogs-group": "/ecs/wobichat",
+            "awslogs-region": "ap-southeast-2",
+            "awslogs-stream-prefix": "chat-service"
+          }
+        }
+      }
+    ]
+  }
