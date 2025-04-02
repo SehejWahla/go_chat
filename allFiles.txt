@@ -873,7 +873,6 @@ http {
 }
 
 // ./server.go
-
 package main
 
 import (
@@ -883,6 +882,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -893,6 +893,19 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
+
+func extractDatabaseFromURI(uri string) string {
+	lastSlash := strings.LastIndex(uri, "/")
+	if lastSlash == -1 {
+		return ""
+	}
+	uri = uri[lastSlash+1:]
+	questionMark := strings.Index(uri, "?")
+	if questionMark == -1 {
+		return uri
+	}
+	return uri[:questionMark]
+}
 
 type Server struct {
 	instanceID        string
@@ -910,6 +923,7 @@ type Server struct {
 	batchTicker       *time.Ticker
 	sequenceNumbers   map[string]int64
 	sequenceNumMutex  sync.Mutex
+	dbName            string
 }
 
 func NewServer() (*Server, error) {
@@ -995,6 +1009,13 @@ func (s *Server) connectToMongoDB() error {
 	if mongoURI == "" {
 		return fmt.Errorf("MONGO_URI environment variable is not set")
 	}
+
+	dbName := extractDatabaseFromURI(mongoURI)
+	if dbName == "" {
+		return fmt.Errorf("no database name found in MONGO_URI")
+	}
+	s.dbName = dbName
+
 	clientOptions := options.Client().ApplyURI(mongoURI)
 	var err error
 	s.mongoClient, err = mongo.Connect(s.ctx, clientOptions)
@@ -1071,6 +1092,7 @@ func (s *Server) handleRedisMessages() {
 				} else {
 					s.storePendingMessage(msgPacket)
 				}
+
 			case "forward_group_message":
 				groupID := message["group_id"].(string)
 				payload := message["payload"].(string)
@@ -1106,6 +1128,7 @@ func (s *Server) handleRedisMessages() {
 						s.storePendingMessage(msgPacket)
 					}
 				}
+
 			case "forward_notification":
 				toUserID := message["to"].(string)
 				payload := message["payload"].(string)
