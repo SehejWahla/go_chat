@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/go-redis/redis/v8"
+	"github.com/golang-jwt/jwt/v4"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
 	"go.mongodb.org/mongo-driver/bson"
@@ -218,6 +219,20 @@ func (s *Server) handleRedisMessages() {
 					s.storePendingMessage(msgPacket)
 				}
 
+			case "close_connection":
+				userID := message["user_id"].(string)
+				connID := message["conn_id"].(string)
+				s.connectionsMux.Lock()
+				if client, ok := s.connections[userID]; ok && client.ConnectionID == connID {
+					client.Connection.Close()
+					delete(s.connections, userID)
+					client.IsConnected = false
+					client.updateConnectionInfo()
+					s.updateUserPresenceState(userID, false)
+					log.Printf("Closed existing connection for user %s on instance %s", userID, s.instanceID)
+				}
+				s.connectionsMux.Unlock()
+
 			case "forward_group_message":
 				groupID := message["group_id"].(string)
 				payload := message["payload"].(string)
@@ -302,16 +317,39 @@ func (s *Server) RegisterRoutes(router *mux.Router) {
 
 func (s *Server) handleWebSocketConnection(w http.ResponseWriter, r *http.Request) {
 	userID := r.URL.Query().Get("user_id")
-	if userID == "" {
-		http.Error(w, "Missing user_id", http.StatusBadRequest)
+	tokenStr := r.URL.Query().Get("token")
+
+	if userID == "" || tokenStr == "" {
+		http.Error(w, "Missing user_id or token", http.StatusUnauthorized)
 		return
 	}
+
+	// Parse and verify the JWT
+	claims := &jwt.MapClaims{}
+	token, err := jwt.ParseWithClaims(tokenStr, claims, func(token *jwt.Token) (interface{}, error) {
+		return []byte(os.Getenv("ACCESS_TOKEN_SECRET")), nil
+	})
+	if err != nil || !token.Valid {
+		http.Error(w, "Invalid or expired token", http.StatusUnauthorized)
+		return
+	}
+
+	// Extract email from token and ensure it matches the provided user_id
+	email, ok := (*claims)["email"].(string)
+	if !ok || email != userID {
+		http.Error(w, "Token email does not match user_id", http.StatusUnauthorized)
+		return
+	}
+
+	// Upgrade the connection
 	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("Error upgrading connection: %v", err)
 		return
 	}
-	client := NewClient(userID, conn, s)
+
+	// Create client with the token
+	client := NewClient(userID, conn, s, tokenStr)
 	s.registerClient(client)
 	s.deliverPendingMessages(client)
 	s.loadUserGroups(client)
@@ -361,10 +399,28 @@ func (s *Server) handleHealthCheck(w http.ResponseWriter, r *http.Request) {
 func (s *Server) registerClient(client *Client) {
 	s.connectionsMux.Lock()
 	defer s.connectionsMux.Unlock()
-	if existing, ok := s.connections[client.UserID]; ok {
-		existing.Connection.Close()
-		delete(s.connections, client.UserID)
+
+	// Check for an existing connection in Redis
+	existingConnID, err := s.redisClient.Get(s.ctx, fmt.Sprintf("user:%s:conn", client.UserID)).Result()
+	if err == nil && existingConnID != "" {
+		existingInstance, err := s.redisClient.Get(s.ctx, fmt.Sprintf("conn:%s:instance", existingConnID)).Result()
+		if err == nil && existingInstance != s.instanceID {
+			// Notify the other instance to close the existing connection
+			closeCmd, _ := json.Marshal(map[string]interface{}{
+				"type":    "close_connection",
+				"user_id": client.UserID,
+				"conn_id": existingConnID,
+			})
+			s.redisClient.Publish(s.ctx, fmt.Sprintf("instance:%s", existingInstance), closeCmd)
+		}
+		// Close any local existing connection
+		if existing, ok := s.connections[client.UserID]; ok {
+			existing.Connection.Close()
+			delete(s.connections, client.UserID)
+		}
 	}
+
+	// Register the new connection
 	s.connections[client.UserID] = client
 	connectionData, _ := json.Marshal(client.connInfo)
 	s.redisClient.Set(s.ctx, fmt.Sprintf("conn:%s", client.ConnectionID), connectionData, 24*time.Hour)

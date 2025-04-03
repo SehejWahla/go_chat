@@ -19,6 +19,7 @@ services:
       - MONGO_URI=mongodb+srv://sehej:Passw0rd942@wobitech.n7ilc.mongodb.net/wobichat-db?retryWrites=true&w=majority&appName=wobitech
       - PORT=8080
       - SERVICE_INSTANCE_ID=instance-1
+      - ACCESS_TOKEN_SECRET=2e3f2d4a1a5d6c7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e
     restart: unless-stopped
 
   chat-service-2:
@@ -39,4 +40,5 @@ services:
       - MONGO_URI=mongodb+srv://sehej:Passw0rd942@wobitech.n7ilc.mongodb.net/wobichat-db?retryWrites=true&w=majority&appName=wobitech
       - PORT=8080
       - SERVICE_INSTANCE_ID=instance-2
+      - ACCESS_TOKEN_SECRET=2e3f2d4a1a5d6c7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e
     restart: unless-stopped

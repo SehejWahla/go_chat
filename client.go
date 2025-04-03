@@ -25,9 +25,10 @@ type Client struct {
 	unackedMessages    map[string]MessagePacket
 	msgMutex           sync.RWMutex
 	connInfo           UserConnection
+	Token              string
 }
 
-func NewClient(userID string, conn *websocket.Conn, server *Server) *Client {
+func NewClient(userID string, conn *websocket.Conn, server *Server, token string) *Client {
 	connectionID := uuid.New().String()
 	connInfo := UserConnection{
 		UserID:       userID,
@@ -49,6 +50,7 @@ func NewClient(userID string, conn *websocket.Conn, server *Server) *Client {
 		unackedMessages: make(map[string]MessagePacket),
 		msgMutex:        sync.RWMutex{},
 		connInfo:        connInfo,
+		Token:           token,
 	}
 }
 
