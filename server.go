@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -177,115 +178,332 @@ func (s *Server) createMongoDBIndexes() error {
 
 func (s *Server) initRedisSubscriptions() error {
 	instanceChannel := fmt.Sprintf("instance:%s", s.instanceID)
-	s.redisPubSub = s.redisClient.Subscribe(s.ctx, instanceChannel, "global:notifications")
+	globalDisconnectChannel := "global:disconnect"
+	s.redisPubSub = s.redisClient.Subscribe(s.ctx, instanceChannel, "global:notifications", globalDisconnectChannel)
 	go s.handleRedisMessages()
-	log.Printf("Subscribed to Redis channels: %s, global:notifications", instanceChannel)
+	log.Printf("Subscribed to Redis channels: %s, global:notifications, %s", instanceChannel, globalDisconnectChannel)
 	return nil
 }
 
-func (s *Server) handleRedisMessages() {
-	for {
-		msg, err := s.redisPubSub.ReceiveMessage(s.ctx)
-		if err != nil {
-			if s.ctx.Err() != nil {
-				return
-			}
-			log.Printf("Error receiving Redis message: %v", err)
-			time.Sleep(100 * time.Millisecond)
-			continue
-		}
-		if msg.Channel == fmt.Sprintf("instance:%s", s.instanceID) {
-			var message map[string]interface{}
-			if err := json.Unmarshal([]byte(msg.Payload), &message); err != nil {
-				log.Printf("Error unmarshaling Redis message: %v", err)
-				continue
-			}
-			switch message["type"] {
-			case "forward_message":
-				recipientID := message["to"].(string)
-				payload := message["payload"].(string)
-				var msgPacket MessagePacket
-				if err := json.Unmarshal([]byte(payload), &msgPacket); err != nil {
-					log.Printf("Error unmarshaling forwarded message: %v", err)
-					continue
+// forceDisconnectClient actively terminates a specific connection ID for a user on the current instance.
+// It ensures only the targeted connection is affected.
+func (s *Server) forceDisconnectClient(userID, connectionIDToDisconnect string) {
+	s.connectionsMux.Lock()
+	clientToDisconnect, ok := s.connections[userID]
+
+	// CRITICAL CHECK: Only disconnect if the client exists AND the connection ID matches the target!
+	if ok && clientToDisconnect.ConnectionID == connectionIDToDisconnect {
+		log.Printf("Force disconnecting client: User %s, Conn %s", userID, connectionIDToDisconnect)
+		// Remove from map *before* closing channels/connections to prevent readPump/writePump
+		// from trying to unregister it again after we release the lock.
+		delete(s.connections, userID)
+		s.connectionsMux.Unlock() // Unlock *before* potentially blocking I/O operations
+
+		// Close the send channel first - signals writePump to exit. Check if already closed.
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("Recovered from panic closing send channel for %s (%s): %v", userID, connectionIDToDisconnect, r)
 				}
-				s.connectionsMux.RLock()
-				recipient, ok := s.connections[recipientID]
-				s.connectionsMux.RUnlock()
-				if ok && recipient.IsConnected {
-					recipient.Send <- []byte(payload)
-					s.sendMessageAck(msgPacket.ID, recipientID, msgPacket.From, "delivered")
+			}()
+			// Check if channel is non-nil and not already closed
+			// A simple non-blocking read check isn't foolproof for detecting closure
+			// A robust way is difficult without extra state, rely on recover for safety
+			// If Send is guaranteed non-nil by constructor:
+			// close(clientToDisconnect.Send)
+			// Safer approach if Send could be nil or closed elsewhere:
+			select {
+			case _, chanOk := <-clientToDisconnect.Send:
+				if chanOk {
+					// Channel was open and had something (unlikely), or was just closed by another goroutine
+					// Re-check or assume closed now
 				} else {
-					s.storePendingMessage(msgPacket)
+					// Channel was already closed
+					log.Printf("Send channel for %s (%s) was already closed.", userID, connectionIDToDisconnect)
+					return // Already closed
 				}
+			default:
+				// Channel is open and empty, or nil. Assume open/nil and try closing.
+				// Need to be careful if nil is possible. Let's assume constructor ensures non-nil.
+				close(clientToDisconnect.Send)
+				log.Printf("Closed send channel for %s (%s)", userID, connectionIDToDisconnect)
+			}
+		}()
 
-			case "close_connection":
-				userID := message["user_id"].(string)
-				connID := message["conn_id"].(string)
-				s.connectionsMux.Lock()
-				if client, ok := s.connections[userID]; ok && client.ConnectionID == connID {
-					client.Connection.Close()
-					delete(s.connections, userID)
-					client.IsConnected = false
-					client.updateConnectionInfo()
-					s.updateUserPresenceState(userID, false)
-					log.Printf("Closed existing connection for user %s on instance %s", userID, s.instanceID)
+		// Close the WebSocket connection - signals readPump to exit.
+		err := clientToDisconnect.Connection.Close()
+		if err != nil {
+			// Log error, but proceed with cleanup. Might be already closed by client.
+			log.Printf("Error closing websocket connection for %s (%s): %v", userID, connectionIDToDisconnect, err)
+		}
+
+		// Clean up connection-specific Redis key (if it exists)
+		connInfoKey := fmt.Sprintf("conn:%s", connectionIDToDisconnect)
+		deletedCount, delErr := s.redisClient.Del(s.ctx, connInfoKey).Result()
+		if delErr != nil {
+			log.Printf("WARN: Failed to delete Redis key %s during force disconnect: %v", connInfoKey, delErr)
+		} else if deletedCount > 0 {
+			log.Printf("Deleted Redis key %s", connInfoKey)
+		}
+
+		log.Printf("Forced disconnect completed for User %s, Conn %s", userID, connectionIDToDisconnect)
+
+	} else {
+		// The client wasn't found, or the connection ID didn't match.
+		s.connectionsMux.Unlock() // Unlock if no action taken
+		if ok {
+			// Found a client for the user, but the connection ID was different.
+			log.Printf("Disconnect request for User %s, Conn %s ignored: Found different Conn %s locally.", userID, connectionIDToDisconnect, clientToDisconnect.ConnectionID)
+		} else {
+			// User wasn't even in the local map.
+			log.Printf("Disconnect request for User %s, Conn %s ignored: User not found locally.", userID, connectionIDToDisconnect)
+		}
+	}
+}
+
+func (s *Server) handleRedisMessages() {
+	ch := s.redisPubSub.Channel() // Use Channel() for better control
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			log.Println("Redis PubSub handler stopping.")
+			err := s.redisPubSub.Close() // Ensure pubsub is closed on shutdown
+			if err != nil {
+				log.Printf("Error closing Redis PubSub: %v", err)
+			}
+			return
+		case msg := <-ch:
+			if msg == nil {
+				// This case typically occurs if the PubSub connection is closed externally or encounters a severe error.
+				log.Println("Redis PubSub channel returned nil message. Attempting to re-subscribe...")
+				// Optional: Add logic to attempt re-subscription with backoff
+				time.Sleep(5 * time.Second) // Prevent tight loop on persistent error
+				// Re-initialize subscription
+				err := s.initRedisSubscriptions()
+				if err != nil {
+					log.Printf("FATAL: Failed to re-subscribe to Redis after channel closure: %v", err)
+					// Consider shutting down the server instance if Redis is critical and cannot reconnect
+					s.Shutdown() // Or trigger a more graceful shutdown sequence
+				} else {
+					log.Println("Successfully re-subscribed to Redis.")
+					// Important: The old goroutine exits here, a new one is started by initRedisSubscriptions
+					return
 				}
-				s.connectionsMux.Unlock()
+			}
 
-			case "forward_group_message":
-				groupID := message["group_id"].(string)
-				payload := message["payload"].(string)
-				// Either use the members variable or don't declare it
-				members, ok := message["members"].([]interface{})
-				if !ok {
-					log.Printf("Error: invalid or missing members for group %s", groupID)
+			// Handle instance-specific messages (forwarding, disconnects)
+			if msg.Channel == fmt.Sprintf("instance:%s", s.instanceID) {
+				var message map[string]interface{}
+				if err := json.Unmarshal([]byte(msg.Payload), &message); err != nil {
+					log.Printf("Error unmarshaling Redis instance message payload '%s': %v", msg.Payload, err)
 					continue
 				}
 
-				var msgPacket MessagePacket
-				if err := json.Unmarshal([]byte(payload), &msgPacket); err != nil {
-					log.Printf("Error unmarshaling group message for group %s: %v", groupID, err)
+				messageType, typeOk := message["type"].(string)
+				if !typeOk {
+					log.Printf("Received Redis message on instance channel without 'type' field: %+v", message)
 					continue
 				}
 
-				// Process the group message and deliver to members
-				for _, member := range members {
-					memberID, ok := member.(string)
-					if !ok {
+				switch messageType {
+				case "forward_message":
+					recipientID, okTo := message["to"].(string)
+					payload, okPayload := message["payload"].(string)
+					if !okTo || !okPayload {
+						log.Printf("Invalid 'forward_message' format: %+v", message)
+						continue
+					}
+
+					var msgPacket MessagePacket
+					if err := json.Unmarshal([]byte(payload), &msgPacket); err != nil {
+						log.Printf("Error unmarshaling forwarded message payload: %v", err)
+						continue
+					}
+					s.connectionsMux.RLock()
+					recipient, ok := s.connections[recipientID]
+					s.connectionsMux.RUnlock()
+					if ok && recipient.IsConnected {
+						// Use non-blocking send to prevent deadlock if client channel is full
+						select {
+						case recipient.Send <- []byte(payload):
+							s.sendMessageAck(msgPacket.ID, recipientID, msgPacket.From, "delivered")
+						default:
+							log.Printf("WARN: Send channel full for user %s (Conn %s), dropping forwarded message %s", recipientID, recipient.ConnectionID, msgPacket.ID)
+							// Consider alternative handling for full buffers (e.g., requeueing, notifying sender)
+						}
+					} else {
+						log.Printf("User %s not found locally for forwarded message %s, might be offline or disconnected", recipientID, msgPacket.ID)
+					}
+
+				case "forward_group_message":
+					groupID, okGroup := message["group_id"].(string)
+					payload, okPayload := message["payload"].(string)
+					membersPayload, okMembers := message["members"]
+					if !okGroup || !okPayload || !okMembers {
+						log.Printf("Invalid 'forward_group_message' format: %+v", message)
+						continue
+					}
+
+					var members []string
+					if membersInterface, ok := membersPayload.([]interface{}); ok {
+						for _, m := range membersInterface {
+							if memberStr, okStr := m.(string); okStr {
+								members = append(members, memberStr)
+							} else {
+								log.Printf("WARN: Non-string member found in forward_group_message members list: %v", m)
+							}
+						}
+					} else {
+						log.Printf("Error: invalid members type (%T) in forward_group_message for group %s", membersPayload, groupID)
+						continue
+					}
+
+					if len(members) == 0 {
+						log.Printf("WARN: Received forward_group_message for group %s with empty resolved members list.", groupID)
+						continue // No one on this instance to send to
+					}
+
+					var msgPacket MessagePacket
+					if err := json.Unmarshal([]byte(payload), &msgPacket); err != nil {
+						log.Printf("Error unmarshaling forwarded group message payload for group %s: %v", groupID, err)
+						continue
+					}
+
+					for _, memberID := range members {
+						s.connectionsMux.RLock()
+						recipient, ok := s.connections[memberID]
+						s.connectionsMux.RUnlock() // Unlock inside loop after check
+						if ok && recipient.IsConnected {
+							// Use non-blocking send
+							select {
+							case recipient.Send <- []byte(payload):
+								s.sendMessageAck(msgPacket.ID, memberID, msgPacket.From, "delivered")
+							default:
+								log.Printf("WARN: Send channel full for user %s (Conn %s), dropping forwarded group message %s", memberID, recipient.ConnectionID, msgPacket.ID)
+							}
+						} else {
+							// This is expected if the member disconnected just after the routing decision was made
+							log.Printf("User %s not found locally for forwarded group message %s", memberID, msgPacket.ID)
+						}
+					}
+
+				case "forward_notification":
+					toUserID, okTo := message["to"].(string)
+					payload, okPayload := message["payload"].(string)
+					if !okTo || !okPayload {
+						log.Printf("Invalid 'forward_notification' format: %+v", message)
 						continue
 					}
 
 					s.connectionsMux.RLock()
-					recipient, ok := s.connections[memberID]
+					client, ok := s.connections[toUserID]
 					s.connectionsMux.RUnlock()
-
-					if ok && recipient.IsConnected {
-						recipient.Send <- []byte(payload)
-						s.sendMessageAck(msgPacket.ID, memberID, msgPacket.From, "delivered")
+					if ok && client.IsConnected {
+						select {
+						case client.Send <- []byte(payload):
+							// Notification sent
+						default:
+							log.Printf("WARN: Send channel full for user %s (Conn %s), dropping forwarded notification", toUserID, client.ConnectionID)
+						}
 					} else {
-						// Store as pending for this member
-						s.storePendingMessage(msgPacket)
+						log.Printf("User %s not found locally for forwarded notification", toUserID)
 					}
-				}
 
-			case "forward_notification":
-				toUserID := message["to"].(string)
-				payload := message["payload"].(string)
-				s.connectionsMux.RLock()
-				client, ok := s.connections[toUserID]
-				s.connectionsMux.RUnlock()
-				if ok && client.IsConnected {
-					client.Send <- []byte(payload)
-				}
-			case "message_ack":
-				messageID := message["message_id"].(string)
-				userID := message["from"].(string)
-				status := message["status"].(string)
-				s.processAcknowledgment(messageID, userID, status)
+				case "disconnect_user":
+					userID, okUser := message["user_id"].(string)
+					connIDToDisconnect, okConn := message["connection_id"].(string)
+					if okUser && okConn {
+						log.Printf("Received request to disconnect User %s (Conn %s) on this instance", userID, connIDToDisconnect)
+						s.forceDisconnectClient(userID, connIDToDisconnect)
+					} else {
+						log.Printf("Error parsing disconnect_user message: %+v", message)
+					}
+
+				case "forward_typing":
+					toUserID, okTo := message["to"].(string)
+					payload, okPayload := message["payload"].(string)
+					// fromUserID might also be useful for context, though not strictly needed to forward
+					// fromUserID, _ := message["from"].(string)
+					if !okTo || !okPayload {
+						log.Printf("Invalid 'forward_typing' format: %+v", message)
+						continue
+					}
+					s.connectionsMux.RLock()
+					recipient, ok := s.connections[toUserID]
+					s.connectionsMux.RUnlock()
+					if ok && recipient.IsConnected {
+						select {
+						case recipient.Send <- []byte(payload):
+							// Typing indicator sent
+						default:
+							log.Printf("WARN: Send channel full for user %s (Conn %s), dropping forwarded typing indicator", toUserID, recipient.ConnectionID)
+						}
+					}
+
+				case "forward_group_typing":
+					groupID, okGroup := message["group_id"].(string)
+					payload, okPayload := message["payload"].(string)
+					membersPayload, okMembers := message["members"]
+					// fromUserID, _ := message["from"].(string) // Optional context
+					if !okGroup || !okPayload || !okMembers {
+						log.Printf("Invalid 'forward_group_typing' format: %+v", message)
+						continue
+					}
+
+					var members []string
+					if membersInterface, ok := membersPayload.([]interface{}); ok {
+						for _, m := range membersInterface {
+							if memberStr, okStr := m.(string); okStr {
+								members = append(members, memberStr)
+							}
+						}
+					} else {
+						log.Printf("Error: invalid members type (%T) in forward_group_typing for group %s", membersPayload, groupID)
+						continue
+					}
+
+					if len(members) == 0 {
+						continue
+					}
+
+					for _, memberID := range members {
+						s.connectionsMux.RLock()
+						recipient, ok := s.connections[memberID]
+						s.connectionsMux.RUnlock()
+						if ok && recipient.IsConnected {
+							select {
+							case recipient.Send <- []byte(payload):
+								// Group typing indicator sent
+							default:
+								log.Printf("WARN: Send channel full for user %s (Conn %s), dropping forwarded group typing indicator", memberID, recipient.ConnectionID)
+							}
+						}
+					}
+
+				default:
+					log.Printf("Received unknown message type '%s' on instance channel: %+v", messageType, message)
+
+				} // end switch messageType
+
+			} else if msg.Channel == "global:notifications" {
+				// Handle global notifications if necessary
+				log.Printf("Received global notification: %s", msg.Payload)
+				// Example: Propagate to all clients on this instance if needed
+				// s.connectionsMux.RLock()
+				// for _, client := range s.connections {
+				//  select {
+				//  case client.Send <- []byte(msg.Payload):
+				//  default: log.Printf("WARN: Send channel full for user %s during global notification broadcast", client.UserID)
+				//  }
+				// }
+				// s.connectionsMux.RUnlock()
+
+			} else {
+				log.Printf("Received message on unexpected Redis channel: %s", msg.Channel)
 			}
-		}
-	}
+		} // end select
+	} // end for
 }
 
 func (s *Server) registerInstance() error {
@@ -397,59 +615,296 @@ func (s *Server) handleHealthCheck(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) registerClient(client *Client) {
-	s.connectionsMux.Lock()
-	defer s.connectionsMux.Unlock()
+	userID := client.UserID
+	newConnectionID := client.ConnectionID
+	newInstanceID := s.instanceID
+	userConnKey := fmt.Sprintf("user:%s:conn", userID)
+	userInstanceKey := fmt.Sprintf("user:%s:instance", userID)
+	connInfoKey := fmt.Sprintf("conn:%s", newConnectionID)
+	presenceKey := fmt.Sprintf("user:%s:presence", userID)
+	lastSeenKey := fmt.Sprintf("user:%s:last_seen", userID)
 
-	// Check for an existing connection in Redis
-	existingConnID, err := s.redisClient.Get(s.ctx, fmt.Sprintf("user:%s:conn", client.UserID)).Result()
-	if err == nil && existingConnID != "" {
-		existingInstance, err := s.redisClient.Get(s.ctx, fmt.Sprintf("conn:%s:instance", existingConnID)).Result()
-		if err == nil && existingInstance != s.instanceID {
-			// Notify the other instance to close the existing connection
-			closeCmd, _ := json.Marshal(map[string]interface{}{
-				"type":    "close_connection",
-				"user_id": client.UserID,
-				"conn_id": existingConnID,
-			})
-			s.redisClient.Publish(s.ctx, fmt.Sprintf("instance:%s", existingInstance), closeCmd)
-		}
-		// Close any local existing connection
-		if existing, ok := s.connections[client.UserID]; ok {
-			existing.Connection.Close()
-			delete(s.connections, client.UserID)
+	log.Printf("Attempting to register client: User %s, New Conn %s, Instance %s", userID, newConnectionID, newInstanceID)
+
+	// --- Atomically update Redis and get previous connection info ---
+	pipe := s.redisClient.Pipeline()
+	prevConnIDCmd := pipe.GetSet(s.ctx, userConnKey, newConnectionID)
+	prevInstanceIDCmd := pipe.GetSet(s.ctx, userInstanceKey, newInstanceID)
+	// Set initial connection info with expiration
+	client.connInfo.InstanceID = newInstanceID // Ensure connInfo has the correct instance ID before saving
+	connectionData, _ := json.Marshal(client.connInfo)
+	pipe.Set(s.ctx, connInfoKey, connectionData, 24*time.Hour)
+	// Set initial presence
+	pipe.Set(s.ctx, presenceKey, "online", 24*time.Hour)
+	pipe.Set(s.ctx, lastSeenKey, time.Now().Unix(), 24*time.Hour)
+
+	// Execute the pipeline
+	_, execErr := pipe.Exec(s.ctx) // Rename err to execErr to avoid confusion later
+
+	// --- MODIFIED ERROR HANDLING for pipe.Exec ---
+	if execErr != nil {
+		if errors.Is(execErr, redis.Nil) {
+			// Treat redis.Nil from Exec as a WARNING, not a fatal error for the pipeline itself.
+			// This might indicate non-existent keys were GetSet, which is expected for new users.
+			// We will proceed to check individual command results.
+			log.Printf("WARN: Redis pipeline Exec returned redis.Nil for User %s, Conn %s. Proceeding to check individual command results. Error: %v", userID, newConnectionID, execErr)
+		} else {
+			// For any other error from Exec (network, transaction error), treat it as fatal.
+			log.Printf("ERROR: Redis pipeline Exec failed during registration for User %s, Conn %s: %v", userID, newConnectionID, execErr)
+			client.Connection.Close() // Close the new connection
+			// Attempt to clean up the potentially half-set keys (best effort)
+			_, delErr := s.redisClient.Del(s.ctx, userConnKey, userInstanceKey, connInfoKey, presenceKey, lastSeenKey).Result()
+			if delErr != nil {
+				log.Printf("WARN: Failed to cleanup keys after pipeline Exec error for user %s: %v", userID, delErr)
+			}
+			return // Stop registration
 		}
 	}
+	// --- END MODIFIED ERROR HANDLING ---
 
-	// Register the new connection
-	s.connections[client.UserID] = client
-	connectionData, _ := json.Marshal(client.connInfo)
-	s.redisClient.Set(s.ctx, fmt.Sprintf("conn:%s", client.ConnectionID), connectionData, 24*time.Hour)
-	s.redisClient.Set(s.ctx, fmt.Sprintf("user:%s:conn", client.UserID), client.ConnectionID, 24*time.Hour)
-	s.redisClient.Set(s.ctx, fmt.Sprintf("user:%s:instance", client.UserID), s.instanceID, 24*time.Hour)
-	s.updateUserPresenceState(client.UserID, true)
-	log.Printf("Client registered: %s (connection %s)", client.UserID, client.ConnectionID)
+	// Now check the results from the individual commands within the pipeline
+	prevConnID, errConn := prevConnIDCmd.Result()
+	isNilConnErr := errors.Is(errConn, redis.Nil) // Check if the key didn't exist before GetSet
+	if errConn != nil && !isNilConnErr {
+		// Log error if GetSet failed for a reason other than Nil
+		log.Printf("ERROR: Failed to get previous connection ID result from Redis pipeline for User %s: %v. State might be inconsistent.", userID, errConn)
+		// Consider if this warrants closing the connection - depends on how critical GetSet success is.
+		// For now, log and continue, as other parts of the pipeline likely succeeded.
+	}
+
+	prevInstanceID, errInstance := prevInstanceIDCmd.Result()
+	isNilInstanceErr := errors.Is(errInstance, redis.Nil)
+	if errInstance != nil && !isNilInstanceErr {
+		// Log error if GetSet failed for a reason other than Nil
+		log.Printf("ERROR: Failed to get previous instance ID result from Redis pipeline for User %s: %v. State might be inconsistent.", userID, errInstance)
+	}
+
+	// Log results (even if there were non-fatal errors getting them)
+	log.Printf("Redis GETSET results: Prev Conn '%s' (Nil err: %v), Prev Instance '%s' (Nil err: %v)",
+		prevConnID, isNilConnErr, prevInstanceID, isNilInstanceErr)
+
+	// --- Handle the previous connection ---
+	// Only proceed if there *was* a previous connection ID returned (errConn is nil or redis.Nil),
+	// and it's different from the new one.
+	if (errConn == nil || isNilConnErr) && prevConnID != "" && prevConnID != newConnectionID {
+		log.Printf("Found previous connection: User %s, Conn %s, Instance %s", userID, prevConnID, prevInstanceID)
+
+		// Determine where the previous connection was
+		// Use the retrieved prevInstanceID. Check errInstance as well for robustness.
+		if prevInstanceID == newInstanceID && (errInstance == nil || isNilInstanceErr) {
+			// Previous connection was on THIS instance
+			log.Printf("Previous connection for %s (%s) was on this instance. Forcing disconnect.", userID, prevConnID)
+			s.forceDisconnectClient(userID, prevConnID)
+		} else if prevInstanceID != "" && (errInstance == nil || isNilInstanceErr) {
+			// Previous connection was on a DIFFERENT, known instance
+			log.Printf("Previous connection for %s (%s) was on different instance (%s). Sending disconnect signal.", userID, prevConnID, prevInstanceID)
+			disconnectMsg := map[string]interface{}{
+				"type":          "disconnect_user",
+				"user_id":       userID,
+				"connection_id": prevConnID,
+			}
+			payload, _ := json.Marshal(disconnectMsg)
+			targetInstanceChannel := fmt.Sprintf("instance:%s", prevInstanceID)
+			errPub := s.redisClient.Publish(s.ctx, targetInstanceChannel, payload).Err()
+			if errPub != nil {
+				log.Printf("ERROR: Failed to publish disconnect signal to instance %s channel %s: %v", prevInstanceID, targetInstanceChannel, errPub)
+			}
+		} else {
+			// Previous connection ID existed, but instance ID was missing, redis.Nil, or had another error.
+			log.Printf("WARNING: Found previous connection ID %s for user %s, but previous instance ID was '%s' (Instance Err: %v). Attempting local disconnect and Redis cleanup.", prevConnID, userID, prevInstanceID, errInstance)
+			// Attempt local disconnect as a fallback.
+			s.forceDisconnectClient(userID, prevConnID)
+			// Also, explicitly delete the potentially orphaned conn info key in Redis for the old connection.
+			_, delErr := s.redisClient.Del(s.ctx, fmt.Sprintf("conn:%s", prevConnID)).Result()
+			if delErr != nil {
+				log.Printf("WARN: Failed to delete orphaned conn key %s for user %s: %v", prevConnID, userID, delErr)
+			}
+		}
+	} else if (errConn == nil || isNilConnErr) && prevConnID == newConnectionID {
+		// This case means GetSet returned the *same* ID we just set. Should be rare with UUIDs.
+		log.Printf("INFO: Previous connection ID %s is the same as the new one for user %s. No disconnect action needed.", prevConnID, userID)
+	}
+
+	// --- Register the NEW client locally in the map ---
+	s.connectionsMux.Lock()
+	existingClient, exists := s.connections[userID]
+	if exists && existingClient.ConnectionID != newConnectionID {
+		log.Printf("WARNING: Stale client %s found in local map for user %s during registration of %s. Closing stale local client.", existingClient.ConnectionID, userID, newConnectionID)
+		staleClient := existingClient
+		delete(s.connections, userID)
+		s.connectionsMux.Unlock()
+
+		// Close resources outside lock
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("Recovered from panic closing stale client send channel for %s (%s): %v", userID, staleClient.ConnectionID, r)
+				}
+			}()
+			close(staleClient.Send)
+		}()
+		staleClient.Connection.Close()
+
+		s.connectionsMux.Lock() // Re-acquire lock
+		s.connections[userID] = client
+		s.connectionsMux.Unlock()
+
+	} else {
+		// No existing client, or existing client IS the new one (harmless overwrite).
+		if exists {
+			log.Printf("INFO: Client %s for user %s already in map during registration. Overwriting.", newConnectionID, userID)
+		}
+		s.connections[userID] = client
+		s.connectionsMux.Unlock()
+	}
+
+	log.Printf("Client registered successfully: User %s, Conn %s, Instance %s", userID, newConnectionID, newInstanceID)
+	// Note: Presence, connection info, user:conn, user:instance keys were set/updated in the pipeline.
 }
 
 func (s *Server) unregisterClient(client *Client) {
+	userID := client.UserID
+	connID := client.ConnectionID // The ID of the connection triggering this unregister
+
+	log.Printf("Unregistering client: User %s, Conn %s", userID, connID)
+
+	// --- Local Map Cleanup ---
 	s.connectionsMux.Lock()
-	defer s.connectionsMux.Unlock()
-	if c, ok := s.connections[client.UserID]; ok && c == client {
-		delete(s.connections, client.UserID)
-		close(client.Send)
+	// Verify that the client being unregistered is *still* the one in the map for this user.
+	// This prevents accidentally removing a *newer* client if a disconnect/reconnect race occurred,
+	// and the readPump for the *old* connection exits slightly later.
+	registeredClient, ok := s.connections[userID]
+	if ok && registeredClient.ConnectionID == connID {
+		// It's the correct client, remove it from the map.
+		log.Printf("Removing client %s (%s) from local map.", userID, connID)
+		delete(s.connections, userID)
+		s.connectionsMux.Unlock() // Unlock after modifying map
+
+		// Close the send channel *after* removing from map to prevent new writes. Check if already closed.
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("Recovered from panic closing send channel during unregister for %s (%s): %v", userID, connID, r)
+				}
+			}()
+			// Assume channel is non-nil from constructor, attempt close. Recover handles double close.
+			// More robust check omitted for brevity, rely on recover.
+			close(client.Send)
+			log.Printf("Closed send channel during unregister for %s (%s)", userID, connID)
+		}()
+
+	} else {
+		// The client in the map is different or doesn't exist. Don't remove it.
+		s.connectionsMux.Unlock() // Unlock as we didn't modify the map
+		if ok {
+			log.Printf("Skipping removal of %s (%s) from map during unregister: Found different connection %s.", userID, connID, registeredClient.ConnectionID)
+		} else {
+			log.Printf("Skipping removal of %s (%s) from map during unregister: User not found.", userID, connID)
+		}
+		// If the client isn't the one in the map, we MUST NOT proceed with Redis cleanup below,
+		// as doing so could interfere with the state of the currently active connection.
+		// Also, don't close the Send channel of the passed 'client' object if it wasn't the registered one.
+		log.Printf("Unregister finished early for %s (%s) as it was not the active client in the map.", userID, connID)
+		return // Exit the function early
 	}
+
+	// --- Update Local Client State (Optional) ---
+	// This client object is now effectively dead.
 	client.IsConnected = false
-	client.updateConnectionInfo()
-	s.redisClient.Del(s.ctx, fmt.Sprintf("user:%s:instance", client.UserID))
-	s.updateUserPresenceState(client.UserID, false)
-	log.Printf("Client unregistered: %s", client.UserID)
+
+	// --- Conditional Redis Cleanup ---
+	// Only clear the user-level Redis keys (instance, presence) if THIS connection
+	// (`connID`) is still the "active" one according to the `user:<userID>:conn` key in Redis.
+	// This prevents an old, slow unregister call from wiping the state set by a newer connection.
+	userConnKey := fmt.Sprintf("user:%s:conn", userID)
+	currentConnIDInRedis, err := s.redisClient.Get(s.ctx, userConnKey).Result()
+
+	if err == nil && currentConnIDInRedis == connID {
+		// This connection IS still the active one in Redis. Perform cleanup.
+		log.Printf("Client %s (%s) is still the active one in Redis. Clearing instance/presence.", userID, connID)
+		pipe := s.redisClient.Pipeline()
+		pipe.Del(s.ctx, fmt.Sprintf("user:%s:instance", userID))
+		// Set presence to offline and update last seen one last time
+		pipe.Set(s.ctx, fmt.Sprintf("user:%s:presence", userID), "offline", 24*time.Hour)
+		pipe.Set(s.ctx, fmt.Sprintf("user:%s:last_seen", userID), time.Now().Unix(), 24*time.Hour)
+		// We can also delete the user:conn key now that we know it matched and we're cleaning up
+		pipe.Del(s.ctx, userConnKey)
+
+		_, pipeErr := pipe.Exec(s.ctx)
+		if pipeErr != nil {
+			log.Printf("WARN: Redis pipeline failed during conditional cleanup for %s (%s): %v", userID, connID, pipeErr)
+		} else {
+			log.Printf("Cleared instance/presence/conn keys in Redis for %s (%s).", userID, connID)
+		}
+
+	} else if errors.Is(err, redis.Nil) {
+		// The user:conn key doesn't exist in Redis at all. This implies cleanup might have already happened
+		// or the user never fully registered. Ensure presence is marked offline just in case.
+		log.Printf("No active connection found in Redis for %s during unregister of %s. Ensuring presence is offline.", userID, connID)
+		pipe := s.redisClient.Pipeline()
+		pipe.Set(s.ctx, fmt.Sprintf("user:%s:presence", userID), "offline", 24*time.Hour)
+		pipe.Set(s.ctx, fmt.Sprintf("user:%s:last_seen", userID), time.Now().Unix(), 24*time.Hour)
+		// If instance key exists without conn key, remove it
+		pipe.Del(s.ctx, fmt.Sprintf("user:%s:instance", userID))
+		_, pipeErr := pipe.Exec(s.ctx)
+		if pipeErr != nil {
+			log.Printf("WARN: Redis pipeline failed during Nil-conn cleanup for %s (%s): %v", userID, connID, pipeErr)
+		}
+
+	} else if err != nil {
+		// Failed to check Redis, log the error but don't attempt cleanup without knowing the state.
+		log.Printf("WARN: Failed to check current Redis connection for %s during unregister of %s: %v. Skipping Redis user-level cleanup.", userID, connID, err)
+	} else {
+		// The connection ID in Redis (currentConnIDInRedis) does NOT match the one being unregistered (connID).
+		// This means a newer connection is already active. DO NOT touch the shared user keys.
+		log.Printf("Skipping Redis user-level cleanup for %s (%s): Newer connection %s is active.", userID, connID, currentConnIDInRedis)
+	}
+
+	// --- Always Clean Up Connection-Specific Redis Key ---
+	// Regardless of whether it was the active connection, the specific `conn:<connID>` key should be removed.
+	connInfoKey := fmt.Sprintf("conn:%s", connID)
+	deletedCount, delErr := s.redisClient.Del(s.ctx, connInfoKey).Result()
+	if delErr != nil {
+		log.Printf("WARN: Failed to delete Redis key %s during unregister: %v", connInfoKey, delErr)
+	} else if deletedCount > 0 {
+		log.Printf("Deleted connection-specific Redis key %s", connInfoKey)
+	}
+
+	log.Printf("Client unregister process finished for: User %s, Conn %s", userID, connID)
 }
 
+// updateConnectionInfo updates secondary details like last_seen, last_sequence, and the specific connection info key in Redis.
+// It should NOT modify the primary user:instance or user:presence keys, which are handled by register/unregister.
 func (s *Server) updateConnectionInfo(connInfo UserConnection) {
-	connectionData, _ := json.Marshal(connInfo)
-	s.redisClient.Set(s.ctx, fmt.Sprintf("conn:%s", connInfo.ConnectionID), connectionData, 24*time.Hour)
-	s.redisClient.Set(s.ctx, fmt.Sprintf("user:%s:last_seen", connInfo.UserID), connInfo.LastSeen.Unix(), 24*time.Hour)
-	if connInfo.LastSequence > 0 {
-		s.redisClient.Set(s.ctx, fmt.Sprintf("user:%s:last_seq", connInfo.UserID), connInfo.LastSequence, 24*time.Hour)
+	// Ensure the connection info object itself is up-to-date before marshaling
+	connInfo.LastSeen = time.Now() // Update LastSeen right before saving
+	connInfo.Connected = true      // Assume still connected if this is called from activity
+
+	connectionData, err := json.Marshal(connInfo)
+	if err != nil {
+		log.Printf("ERROR: Failed to marshal connection info for Conn %s: %v", connInfo.ConnectionID, err)
+		return
+	}
+
+	// Update connection specific details with expiration
+	connInfoKey := fmt.Sprintf("conn:%s", connInfo.ConnectionID)
+	// Update user-level details (last seen, sequence) - Use Pipelining
+	userLastSeenKey := fmt.Sprintf("user:%s:last_seen", connInfo.UserID)
+	userLastSeqKey := fmt.Sprintf("user:%s:last_seq", connInfo.UserID)
+
+	pipe := s.redisClient.Pipeline()
+	pipe.Set(s.ctx, connInfoKey, connectionData, 24*time.Hour)
+	pipe.Set(s.ctx, userLastSeenKey, connInfo.LastSeen.Unix(), 24*time.Hour)
+	if connInfo.LastSequence > 0 { // Only update sequence if it's meaningful
+		pipe.Set(s.ctx, userLastSeqKey, connInfo.LastSequence, 24*time.Hour)
+	}
+
+	// Optionally update presence ONLY if setting to 'online' (but register/unregister are primary)
+	// pipe.Set(s.ctx, fmt.Sprintf("user:%s:presence", connInfo.UserID), "online", 24*time.Hour)
+
+	_, pipeErr := pipe.Exec(s.ctx)
+	if pipeErr != nil {
+		log.Printf("WARN: Error executing pipeline for updateConnectionInfo for user %s, conn %s: %v", connInfo.UserID, connInfo.ConnectionID, pipeErr)
 	}
 }
 
@@ -952,23 +1407,46 @@ func (s *Server) routeGroupTypingIndicator(fromUserID, groupID string, notificat
 	}
 }
 
+// updateUserPresenceState updates the user's presence status ('online'/'offline') and last_seen time in Redis.
+// It's called during registration, unregistration, and potentially periodic heartbeats.
 func (s *Server) updateUserPresenceState(userID string, isOnline bool) {
-	status := "online"
-	if !isOnline {
-		status = "offline"
+	status := "offline"
+	if isOnline {
+		status = "online"
 	}
 	presenceKey := fmt.Sprintf("user:%s:presence", userID)
 	lastSeenKey := fmt.Sprintf("user:%s:last_seen", userID)
-	now := time.Now()
+
+	// Get current time for last_seen
+	now := time.Now().Unix()
+
+	// Use a pipeline to set both keys atomically (relative to Redis execution)
 	pipe := s.redisClient.Pipeline()
-	pipe.Set(s.ctx, presenceKey, status, 24*time.Hour)
-	pipe.Set(s.ctx, lastSeenKey, now.Unix(), 24*time.Hour)
-	if isOnline {
-		pipe.Set(s.ctx, fmt.Sprintf("user:%s:instance", userID), s.instanceID, 24*time.Hour)
+	pipe.Set(s.ctx, presenceKey, status, 24*time.Hour) // Set presence with expiration
+	pipe.Set(s.ctx, lastSeenKey, now, 24*time.Hour)    // Update last_seen with expiration
+
+	// Execute the pipeline
+	_, err := pipe.Exec(s.ctx)
+	if err != nil {
+		log.Printf("WARN: Error executing Redis pipeline for updateUserPresenceState for user %s to %s: %v", userID, status, err)
 	} else {
-		pipe.Del(s.ctx, fmt.Sprintf("user:%s:instance", userID))
+		log.Printf("Updated presence for user %s to %s (Last Seen: %d)", userID, status, now)
 	}
-	pipe.Exec(s.ctx)
+
+	// Optional: Broadcast presence change via Pub/Sub if needed by other services/clients
+	/*
+		presenceUpdate := map[string]interface{}{
+		    "type": "presence_update",
+		    "user_id": userID,
+		    "status": status,
+		    "last_seen": now,
+		}
+		payload, _ := json.Marshal(presenceUpdate)
+		errPub := s.redisClient.Publish(s.ctx, "global:presence", payload).Err()
+		if errPub != nil {
+		    log.Printf("WARN: Failed to publish presence update for user %s: %v", userID, errPub)
+		}
+	*/
 }
 
 func (s *Server) handleOnlineStatusCheck(client *Client, targetUserID string) {
