@@ -1,883 +1,109 @@
-// ./deploy.yml
-name: Deploy to ECS
-
-on:
-  push:
-    branches:
-      - main
-
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v2
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v1
-
-      - name: Build Docker image
-        run: |
-          docker build --platform linux/amd64 -t wobichat/chat-service .
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v1
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ap-southeast-2  
-
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v1
-
-      - name: Tag and push image to Amazon ECR
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: wobichat/chat-service
-          IMAGE_TAG: latest
-        run: |
-          docker tag wobichat/chat-service $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-
-      - name: Deploy to ECS
-        run: |
-          aws ecs update-service --cluster wobichat-cluster --service wobichat-service --force-new-deployment
-
-
-
-// ./env
-# Kafka Configuration (Confluent Cloud)
-KAFKA_BOOTSTRAP_SERVERS=pkc-921jm.us-east-2.aws.confluent.cloud:9092
-KAFKA_API_KEY=JUHXV3WXBZE4XCJ6
-KAFKA_API_SECRET=fEdbPtUfESqBhNjIecbIphJbTNz9Y3kQlGoKe+Av3aLG0p/zMXdzuhpAkiwifWK7
-
-# Redis Configuration
-REDIS_ADDR=redis:6379
-REDIS_PASSWORD=
-
-# MongoDB Configuration
-MONGO_URI=mongodb+srv://sehej:Passw0rd942@wobitech.n7ilc.mongodb.net/wobichat-db?retryWrites=true&w=majority&appName=wobitech
-
-# .env
-REDIS_HOST=redis-16702.c124.us-central1-1.gce.redns.redis-cloupd.com
-REDIS_PORT=16702
-REDIS_USERNAME=default
-REDIS_PASSWORD=C9vQpbNP9YqVj1OeHmXTpCxlDKk4TxA0
-
-# Server Configuration
-PORT=8080
-
-// ./client.go
-package main
-
-import (
-	"encoding/json"
-	"log"
-	"sync"
-	"time"
-
-	"github.com/google/uuid"
-	"github.com/gorilla/websocket"
-)
-
-type Client struct {
-	UserID             string
-	ConnectionID       string
-	Connection         *websocket.Conn
-	Server             *Server
-	Send               chan []byte
-	Groups             []string
-	LastSeen           time.Time
-	IsConnected        bool
-	DeviceInfo         string
-	ClientVersion      string
-	lastSequenceNumber int64
-	unackedMessages    map[string]MessagePacket
-	msgMutex           sync.RWMutex
-	connInfo           UserConnection
-}
-
-func NewClient(userID string, conn *websocket.Conn, server *Server) *Client {
-	connectionID := uuid.New().String()
-	connInfo := UserConnection{
-		UserID:       userID,
-		ConnectionID: connectionID,
-		InstanceID:   server.instanceID,
-		Connected:    true,
-		LastSeen:     time.Now(),
-		LastSequence: 0,
-	}
-	return &Client{
-		UserID:          userID,
-		ConnectionID:    connectionID,
-		Connection:      conn,
-		Server:          server,
-		Send:            make(chan []byte, 256),
-		Groups:          []string{},
-		LastSeen:        time.Now(),
-		IsConnected:     true,
-		unackedMessages: make(map[string]MessagePacket),
-		msgMutex:        sync.RWMutex{},
-		connInfo:        connInfo,
-	}
-}
-
-func (c *Client) readPump() {
-	defer func() {
-		c.Server.unregisterClient(c)
-		c.Connection.Close()
-	}()
-
-	c.Connection.SetReadDeadline(time.Now().Add(60 * time.Second))
-	c.Connection.SetPongHandler(func(string) error {
-		c.Connection.SetReadDeadline(time.Now().Add(60 * time.Second))
-		return nil
-	})
-
-	for {
-		_, message, err := c.Connection.ReadMessage()
-		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				log.Printf("WebSocket read error: %v", err)
-			}
-			break
-		}
-
-		var packet struct {
-			Action       string          `json:"action"`
-			To           string          `json:"to"`
-			Content      json.RawMessage `json:"content"`
-			ClientMsgID  string          `json:"client_msg_id,omitempty"`
-			AckMessageID string          `json:"ack_message_id,omitempty"`
-			AckStatus    string          `json:"ack_status,omitempty"`
-		}
-		if err := json.Unmarshal(message, &packet); err != nil {
-			log.Printf("Error parsing message: %v", err)
-			continue
-		}
-
-		c.LastSeen = time.Now()
-		c.updateConnectionInfo()
-
-		switch packet.Action {
-		case "direct_message":
-			c.Server.handleClientDirectMessage(c, packet.To, packet.Content, packet.ClientMsgID)
-		case "group_message":
-			c.Server.handleClientGroupMessage(c, packet.To, packet.Content, packet.ClientMsgID)
-		case "create_group":
-			var groupData struct {
-				Name    string   `json:"name"`
-				Members []string `json:"members"`
-			}
-			if err := json.Unmarshal(packet.Content, &groupData); err != nil {
-				log.Printf("Error parsing group data: %v", err)
-				continue
-			}
-			if !contains(groupData.Members, c.UserID) {
-				groupData.Members = append([]string{c.UserID}, groupData.Members...)
-			}
-			c.Server.handleCreateGroup(c, groupData.Name, groupData.Members)
-		case "message_ack":
-			if packet.AckMessageID != "" {
-				c.Server.handleMessageAck(c, packet.AckMessageID, packet.AckStatus)
-			}
-		case "load_history":
-			var historyRequest struct {
-				ChatID  string `json:"chat_id"`
-				Before  int64  `json:"before,omitempty"`
-				Limit   int    `json:"limit,omitempty"`
-				IsGroup bool   `json:"is_group"`
-			}
-			if err := json.Unmarshal(packet.Content, &historyRequest); err != nil {
-				log.Printf("Error parsing history request: %v", err)
-				continue
-			}
-			c.Server.handleHistoryRequest(c, historyRequest.ChatID, historyRequest.Before, historyRequest.Limit, historyRequest.IsGroup)
-		case "presence":
-			c.Server.updateUserPresence(c)
-		case "typing":
-			c.Server.handleTypingIndicator(c, packet.To)
-		case "check_online_status":
-			var checkRequest struct {
-				UserID string `json:"user_id"`
-			}
-			if err := json.Unmarshal(packet.Content, &checkRequest); err != nil {
-				log.Printf("Error parsing online status check: %v", err)
-				continue
-			}
-			c.Server.handleOnlineStatusCheck(c, checkRequest.UserID)
-		}
-	}
-}
-
-func (c *Client) writePump() {
-	ticker := time.NewTicker(30 * time.Second)
-	defer func() {
-		ticker.Stop()
-		c.Connection.Close()
-	}()
-
-	for {
-		select {
-		case message, ok := <-c.Send:
-			c.Connection.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			if !ok {
-				c.Connection.WriteMessage(websocket.CloseMessage, []byte{})
-				return
-			}
-			w, err := c.Connection.NextWriter(websocket.TextMessage)
-			if err != nil {
-				return
-			}
-			w.Write(message)
-			n := len(c.Send)
-			for i := 0; i < n; i++ {
-				w.Write([]byte{'\n'})
-				w.Write(<-c.Send)
-			}
-			if err := w.Close(); err != nil {
-				return
-			}
-		case <-ticker.C:
-			c.Connection.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			if err := c.Connection.WriteMessage(websocket.PingMessage, nil); err != nil {
-				return
-			}
-			c.LastSeen = time.Now()
-			c.updateConnectionInfo()
-		}
-	}
-}
-
-func (c *Client) updateConnectionInfo() {
-	c.connInfo.LastSeen = c.LastSeen
-	c.connInfo.Connected = c.IsConnected
-	c.Server.updateConnectionInfo(c.connInfo)
-}
-
-func (c *Client) addUnacknowledgedMessage(msg MessagePacket) {
-	c.msgMutex.Lock()
-	defer c.msgMutex.Unlock()
-	c.unackedMessages[msg.ID] = msg
-}
-
-func (c *Client) removeUnacknowledgedMessage(messageID string) {
-	c.msgMutex.Lock()
-	defer c.msgMutex.Unlock()
-	delete(c.unackedMessages, messageID)
-}
-
-func contains(slice []string, item string) bool {
-	for _, s := range slice {
-		if s == item {
-			return true
-		}
-	}
-	return false
-}
+/ ./wobichat-task.json
+{
+    "family": "wobichat-task",
+    "networkMode": "awsvpc",
+    "requiresCompatibilities": ["FARGATE"],
+    "cpu": "512",
+    "memory": "1024",
+    "executionRoleArn": "arn:aws:iam::754590379920:role/ecsTaskExecutionRole",
+    "containerDefinitions": [
+      {
+        "name": "chat-service",
+        "image": "754590379920.dkr.ecr.ap-southeast-2.amazonaws.com/wobichat/chat-service:latest",
+        "portMappings": [
+          {
+            "containerPort": 8080,
+            "protocol": "tcp"
+          }
+        ],
+        "environment": [
+          {
+            "name": "KAFKA_BOOTSTRAP_SERVERS",
+            "value": "pkc-921jm.us-east-2.aws.confluent.cloud:9092"
+          },
+          {
+            "name": "KAFKA_API_KEY",
+            "value": "JUHXV3WXBZE4XCJ6"
+          },
+          {
+            "name": "KAFKA_API_SECRET",
+            "value": "fEdbPtUfESqBhNjIecbIphJbTNz9Y3kQlGoKe+Av3aLG0p/zMXdzuhpAkiwifWK7"
+          },
+          {
+            "name": "REDIS_HOST",
+            "value": "redis-16702.c124.us-central1-1.gce.redns.redis-cloud.com"
+          },
+          {
+            "name": "REDIS_PORT",
+            "value": "16702"
+          },
+          {
+            "name": "REDIS_USERNAME",
+            "value": "default"
+          },
+          {
+            "name": "REDIS_PASSWORD",
+            "value": "C9vQpbNP9YqVj1OeHmXTpCxlDKk4TxA0"
+          },
+          {
+            "name": "MONGO_URI",
+            "value": "mongodb+srv://sehej:Passw0rd942@wobitech.n7ilc.mongodb.net/wobichat-db?retryWrites=true&w=majority&appName=wobitech"
+          },
+          {
+            "name": "PORT",
+            "value": "8080"
+          },
+          {
+            "name": "ACCESS_TOKEN_SECRET",
+            "value": "2e3f2d4a1a5d6c7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e"
+          }
+        ],
+        "logConfiguration": {
+          "logDriver": "awslogs",
+          "options": {
+            "awslogs-group": "/ecs/wobichat",
+            "awslogs-region": "ap-southeast-2",
+            "awslogs-stream-prefix": "chat-service"
+          }
+        }
+      }
+    ]
+  }
 
 
-// ./docker-compose.yml
-version: '3.8'
+  ./ setup.sh
+  #!/bin/bash
 
-services:
-  chat-service-1:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: chat-service-1
-    ports:
-      - "8080:8080"
-    environment:
-      - KAFKA_BOOTSTRAP_SERVERS=${KAFKA_BOOTSTRAP_SERVERS}
-      - KAFKA_API_KEY=${KAFKA_API_KEY}
-      - KAFKA_API_SECRET=${KAFKA_API_SECRET}
-      - REDIS_HOST=redis-16702.c124.us-central1-1.gce.redns.redis-cloud.com
-      - REDIS_PORT=16702
-      - REDIS_USERNAME=default
-      - REDIS_PASSWORD=C9vQpbNP9YqVj1OeHmXTpCxlDKk4TxA0
-      - MONGO_URI=mongodb+srv://sehej:Passw0rd942@wobitech.n7ilc.mongodb.net/wobichat-db?retryWrites=true&w=majority&appName=wobitech
-      - PORT=8080
-      - SERVICE_INSTANCE_ID=instance-1
-    restart: unless-stopped
+# Install dependencies
+echo "Installing dependencies..."
+go mod tidy
 
-  chat-service-2:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: chat-service-2
-    ports:
-      - "8081:8080"
-    environment:
-      - KAFKA_BOOTSTRAP_SERVERS=${KAFKA_BOOTSTRAP_SERVERS}
-      - KAFKA_API_KEY=${KAFKA_API_KEY}
-      - KAFKA_API_SECRET=${KAFKA_API_SECRET}
-      - REDIS_HOST=redis-16702.c124.us-central1-1.gce.redns.redis-cloud.com
-      - REDIS_PORT=16702
-      - REDIS_USERNAME=default
-      - REDIS_PASSWORD=C9vQpbNP9YqVj1OeHmXTpCxlDKk4TxA0
-      - MONGO_URI=mongodb+srv://sehej:Passw0rd942@wobitech.n7ilc.mongodb.net/wobichat-db?retryWrites=true&w=majority&appName=wobitech
-      - PORT=8080
-      - SERVICE_INSTANCE_ID=instance-2
-    restart: unless-stopped
+# Build the application
+echo "Building the application..."
+go build -o chat-service .
 
-// ./Dockerfile
-FROM golang:1.19 AS builder
+# Start Docker services
+echo "Starting Docker services..."
+docker-compose up -d
 
-# Install required packages for Confluent Kafka
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    bash \
-    git \
-    openssh-client \
-    pkg-config \
-    librdkafka-dev
+# Check if Docker services are running
+echo "Checking Docker services..."
+docker-compose ps
 
-WORKDIR /app
-COPY go.mod go.sum ./
-RUN go mod download
-COPY *.go ./
-RUN go build -o chat-service .
-
-FROM golang:1.19
-RUN apt-get update && apt-get install -y \
-    librdkafka1 \
-    ca-certificates
-
-WORKDIR /app
-COPY --from=builder /app/chat-service .
-COPY .env .
-EXPOSE 8080
-CMD ["./chat-service"]
+echo "Setup complete! The application is now running."
+echo "Service endpoints:"
+echo "- Chat service 1: http://localhost:8080"
+echo "- Chat service 2: http://localhost:8081"
+echo "- Load balancer: http://localhost:80"
 
 
-// ./kafka_client.go
+./ server.go
 package main
 
 import (
 	"context"
 	"encoding/json"
-	"fmt"
-	"log"
-	"os"
-	"sync"
-	"time"
-
-	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
-)
-
-const (
-	TopicMessages      = "chat.messages"
-	TopicEvents        = "chat.events"
-	TopicNotifications = "chat.notifications"
-	TopicBatchInserts  = "chat.batch.inserts"
-	ConsumerGroupID    = "chat-service-group"
-)
-
-type KafkaClient struct {
-	bootstrapServers string
-	apiKey           string
-	apiSecret        string
-	producer         *kafka.Producer
-	consumers        []*kafka.Consumer
-	ctx              context.Context
-	cancelFunc       context.CancelFunc
-	mu               sync.RWMutex
-}
-
-func NewKafkaClient(bootstrapServers string) (*KafkaClient, error) {
-	ctx, cancel := context.WithCancel(context.Background())
-	apiKey := os.Getenv("KAFKA_API_KEY")
-	apiSecret := os.Getenv("KAFKA_API_SECRET")
-
-	config := &kafka.ConfigMap{
-		"bootstrap.servers": bootstrapServers,
-		"security.protocol": "SASL_SSL",
-		"sasl.mechanisms":   "PLAIN",
-		"sasl.username":     apiKey,
-		"sasl.password":     apiSecret,
-		"acks":              "all",
-	}
-
-	producer, err := kafka.NewProducer(config)
-	if err != nil {
-		cancel()
-		return nil, fmt.Errorf("failed to create producer: %v", err)
-	}
-
-	go func() {
-		for e := range producer.Events() {
-			switch ev := e.(type) {
-			case *kafka.Message:
-				if ev.TopicPartition.Error != nil {
-					log.Printf("Delivery failed: %v", ev.TopicPartition.Error)
-				}
-			case kafka.Error:
-				log.Printf("Producer error: %v", ev)
-			}
-		}
-	}()
-
-	client := &KafkaClient{
-		bootstrapServers: bootstrapServers,
-		apiKey:           apiKey,
-		apiSecret:        apiSecret,
-		producer:         producer,
-		ctx:              ctx,
-		cancelFunc:       cancel,
-	}
-
-	if err := client.checkKafkaConnection(); err != nil {
-		client.Close()
-		return nil, fmt.Errorf("failed to connect to Kafka: %v", err)
-	}
-
-	log.Println("Successfully connected to Kafka")
-	return client, nil
-}
-
-func (k *KafkaClient) checkKafkaConnection() error {
-	admin, err := kafka.NewAdminClientFromProducer(k.producer)
-	if err != nil {
-		return fmt.Errorf("failed to create admin client: %v", err)
-	}
-	defer admin.Close()
-
-	metadata, err := admin.GetMetadata(nil, true, 5000)
-	if err != nil {
-		return fmt.Errorf("failed to get metadata: %v", err)
-	}
-	log.Printf("Connected to Kafka, broker count: %d", len(metadata.Brokers))
-	return nil
-}
-
-func (k *KafkaClient) PublishMessage(msg MessagePacket) error {
-	value, err := json.Marshal(msg)
-	if err != nil {
-		return fmt.Errorf("failed to marshal message: %v", err)
-	}
-	topic := TopicMessages
-	return k.producer.Produce(&kafka.Message{
-		TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: kafka.PartitionAny},
-		Key:            []byte(msg.ID),
-		Value:          value,
-		Headers:        []kafka.Header{{Key: "message_type", Value: []byte(msg.Type)}},
-	}, nil)
-}
-
-func (k *KafkaClient) PublishEvent(event ChatEvent) error {
-	value, err := json.Marshal(event)
-	if err != nil {
-		return fmt.Errorf("failed to marshal event: %v", err)
-	}
-	topic := TopicEvents
-	return k.producer.Produce(&kafka.Message{
-		TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: kafka.PartitionAny},
-		Key:            []byte(event.ID),
-		Value:          value,
-		Headers:        []kafka.Header{{Key: "event_type", Value: []byte(event.Type)}},
-	}, nil)
-}
-
-func (k *KafkaClient) CreateConsumerGroup(topics []string, groupIDPrefix string) error {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-
-	if groupIDPrefix == "" {
-		groupIDPrefix = ConsumerGroupID
-	}
-	instanceID := os.Getenv("SERVICE_INSTANCE_ID")
-	if instanceID == "" {
-		instanceID = NewUUID()
-	}
-	groupID := fmt.Sprintf("%s-%s", groupIDPrefix, instanceID)
-
-	config := &kafka.ConfigMap{
-		"bootstrap.servers":  k.bootstrapServers,
-		"security.protocol":  "SASL_SSL",
-		"sasl.mechanisms":    "PLAIN",
-		"sasl.username":      k.apiKey,
-		"sasl.password":      k.apiSecret,
-		"group.id":           groupID,
-		"auto.offset.reset":  "earliest",
-		"enable.auto.commit": "true",
-	}
-
-	for _, topic := range topics {
-		consumer, err := kafka.NewConsumer(config)
-		if err != nil {
-			return fmt.Errorf("failed to create consumer for %s: %v", topic, err)
-		}
-		if err := consumer.Subscribe(topic, nil); err != nil {
-			consumer.Close()
-			return fmt.Errorf("failed to subscribe to %s: %v", topic, err)
-		}
-		k.consumers = append(k.consumers, consumer)
-		log.Printf("Created consumer for topic %s with group ID %s", topic, groupID)
-	}
-	return nil
-}
-
-func (k *KafkaClient) StartConsumers(server *Server) error {
-	if err := k.CreateConsumerGroup([]string{TopicMessages}, ""); err != nil {
-		return err
-	}
-	if err := k.CreateConsumerGroup([]string{TopicEvents}, "events-"); err != nil {
-		return err
-	}
-
-	k.mu.RLock()
-	defer k.mu.RUnlock()
-	for _, consumer := range k.consumers {
-		topics, err := consumer.Subscription()
-		if err != nil {
-			log.Printf("Error getting subscription for consumer: %v", err)
-			continue
-		}
-		if len(topics) > 0 {
-			switch topics[0] {
-			case TopicMessages:
-				go k.consumeMessages(consumer, server)
-			case TopicEvents:
-				go k.consumeEvents(consumer, server)
-			}
-		}
-	}
-	log.Println("Kafka consumers started successfully")
-	return nil
-}
-
-func (k *KafkaClient) consumeMessages(consumer *kafka.Consumer, server *Server) {
-	defer consumer.Close()
-	for {
-		select {
-		case <-k.ctx.Done():
-			log.Println("Consumer stopped due to context cancellation")
-			return
-		default:
-			msg, err := consumer.ReadMessage(1 * time.Second)
-			if err != nil {
-				if kafkaErr, ok := err.(kafka.Error); ok && kafkaErr.Code() == kafka.ErrTimedOut {
-					continue
-				}
-				log.Printf("Error reading message: %v", err)
-				time.Sleep(5 * time.Second)
-				continue
-			}
-			var msgPacket MessagePacket
-			if err := json.Unmarshal(msg.Value, &msgPacket); err != nil {
-				log.Printf("Error unmarshaling message: %v", err)
-				continue
-			}
-			switch msgPacket.Type {
-			case "direct":
-				server.routeDirectMessage(msgPacket)
-			case "group":
-				server.routeGroupMessage(msgPacket)
-			}
-		}
-	}
-}
-
-func (k *KafkaClient) consumeEvents(consumer *kafka.Consumer, server *Server) {
-	defer consumer.Close()
-	for {
-		select {
-		case <-k.ctx.Done():
-			log.Println("Event consumer stopped due to context cancellation")
-			return
-		default:
-			msg, err := consumer.ReadMessage(1 * time.Second)
-			if err != nil {
-				if kafkaErr, ok := err.(kafka.Error); ok && kafkaErr.Code() == kafka.ErrTimedOut {
-					continue
-				}
-				log.Printf("Error reading event: %v", err)
-				time.Sleep(5 * time.Second)
-				continue
-			}
-			var event ChatEvent
-			if err := json.Unmarshal(msg.Value, &event); err != nil {
-				log.Printf("Error unmarshaling event: %v", err)
-				continue
-			}
-			switch event.Type {
-			case "message_ack":
-				var ack MessageAck
-				if err := json.Unmarshal(event.Data, &ack); err != nil {
-					log.Printf("Error unmarshaling ack: %v", err)
-					continue
-				}
-				server.processAcknowledgment(ack.MessageID, ack.UserID, ack.Status)
-			case "connection":
-				server.updateUserPresenceState(event.UserID, true)
-			case "disconnection":
-				server.updateUserPresenceState(event.UserID, false)
-			case "group_created":
-				var group GroupMetadata
-				if err := json.Unmarshal(event.Data, &group); err != nil {
-					log.Printf("Error unmarshaling group data: %v", err)
-					continue
-				}
-				for _, memberID := range group.Members {
-					server.connectionsMux.RLock()
-					member, ok := server.connections[memberID]
-					server.connectionsMux.RUnlock()
-					if ok && member.IsConnected {
-						if !contains(member.Groups, group.ID) {
-							server.connectionsMux.Lock()
-							member.Groups = append(member.Groups, group.ID)
-							server.connectionsMux.Unlock()
-							if memberID != group.CreatedBy {
-								notification := CreateNotification("group_added", map[string]interface{}{
-									"group_id": group.ID,
-									"name":     group.Name,
-									"members":  group.Members,
-								})
-								notificationJSON, _ := json.Marshal(notification)
-								member.Send <- notificationJSON
-							}
-						}
-					}
-				}
-			}
-		}
-	}
-}
-
-func (k *KafkaClient) Close() error {
-	k.cancelFunc()
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	if k.producer != nil {
-		k.producer.Flush(10000)
-		k.producer.Close()
-	}
-	for _, consumer := range k.consumers {
-		consumer.Close()
-	}
-	return nil
-}
-
-// ./main.go
-package main
-
-import (
-	"context"
-	"log"
-	"net/http"
-	"os"
-	"os/signal"
-	"syscall"
-	"time"
-
-	"github.com/gorilla/mux"
-	"github.com/joho/godotenv"
-)
-
-func main() {
-	godotenv.Load()
-
-	server, err := NewServer()
-	if err != nil {
-		log.Fatalf("Failed to create server: %v", err)
-	}
-
-	if err := server.Initialize(); err != nil {
-		log.Fatalf("Failed to initialize server: %v", err)
-	}
-
-	router := mux.NewRouter()
-	server.RegisterRoutes(router)
-
-	httpServer := &http.Server{
-		Addr:    ":" + os.Getenv("PORT"),
-		Handler: router,
-	}
-	if httpServer.Addr == ":" {
-		httpServer.Addr = ":8080"
-	}
-
-	go func() {
-		log.Printf("Starting server on %s", httpServer.Addr)
-		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("Failed to start server: %v", err)
-		}
-	}()
-
-	if err := server.kafkaClient.StartConsumers(server); err != nil {
-		log.Fatalf("Failed to start Kafka consumers: %v", err)
-	}
-
-	go server.StartBatchProcessor()
-
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
-	<-stop
-	log.Println("Shutting down server...")
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	if err := httpServer.Shutdown(ctx); err != nil {
-		log.Fatalf("Server shutdown failed: %v", err)
-	}
-
-	server.Shutdown()
-	log.Println("Server shutdown complete")
-}
-
-
-// ./message.go
-package main
-
-import (
-	"encoding/json"
-	"time"
-
-	"github.com/google/uuid"
-)
-
-type MessagePacket struct {
-	ID          string          `json:"id" bson:"id"`
-	Type        string          `json:"type" bson:"type"`
-	Action      string          `json:"action,omitempty" bson:"action,omitempty"`
-	From        string          `json:"from" bson:"from"`
-	To          string          `json:"to" bson:"to"`
-	Content     json.RawMessage `json:"content" bson:"content"`
-	Timestamp   time.Time       `json:"timestamp" bson:"timestamp"`
-	Status      string          `json:"status,omitempty" bson:"status,omitempty"`
-	DeliveredAt time.Time       `json:"delivered_at,omitempty" bson:"delivered_at,omitempty"`
-	ReadAt      time.Time       `json:"read_at,omitempty" bson:"read_at,omitempty"`
-	ClientMsgID string          `json:"client_msg_id,omitempty" bson:"client_msg_id,omitempty"`
-	SequenceNum int64           `json:"seq_num,omitempty" bson:"seq_num,omitempty"`
-}
-
-type ChatEvent struct {
-	ID        string          `json:"id" bson:"id"`
-	Type      string          `json:"type" bson:"type"`
-	UserID    string          `json:"user_id" bson:"user_id"`
-	Data      json.RawMessage `json:"data" bson:"data"`
-	Timestamp time.Time       `json:"timestamp" bson:"timestamp"`
-}
-
-type GroupMetadata struct {
-	ID          string    `json:"id" bson:"_id"`
-	Name        string    `json:"name" bson:"name"`
-	Members     []string  `json:"members" bson:"members"`
-	CreatedAt   time.Time `json:"created_at" bson:"created_at"`
-	CreatedBy   string    `json:"created_by" bson:"created_by"`
-	LastMessage time.Time `json:"last_message" bson:"last_message"`
-}
-
-type UserConnection struct {
-	UserID        string    `json:"user_id" bson:"user_id"`
-	ConnectionID  string    `json:"connection_id" bson:"connection_id"`
-	InstanceID    string    `json:"instance_id" bson:"instance_id"`
-	Connected     bool      `json:"connected" bson:"connected"`
-	LastSeen      time.Time `json:"last_seen" bson:"last_seen"`
-	LastSequence  int64     `json:"last_sequence" bson:"last_sequence"`
-	Device        string    `json:"device" bson:"device"`
-	ClientVersion string    `json:"client_version" bson:"client_version"`
-}
-
-type MessageAck struct {
-	UserID    string    `json:"user_id"`
-	MessageID string    `json:"message_id"`
-	Status    string    `json:"status"`
-	Timestamp time.Time `json:"timestamp"`
-}
-
-func CreateNotification(action string, data map[string]interface{}) MessagePacket {
-	content, _ := json.Marshal(data)
-	return MessagePacket{
-		ID:        NewUUID(),
-		Type:      "notification",
-		Action:    action,
-		Content:   content,
-		Timestamp: time.Now(),
-		Status:    "sent",
-	}
-}
-
-func NewUUID() string {
-	return uuid.New().String()
-}
-
-
-// ./nginx.conf
-user nginx;
-worker_processes auto;
-error_log /var/log/nginx/error.log warn;
-pid /var/run/nginx.pid;
-
-events {
-    worker_connections 1024;
-}
-
-http {
-    include /etc/nginx/mime.types;
-    default_type application/octet-stream;
-    log_format main '$remote_addr - $remote_user [$time_local] "$request" '
-                     '$status $body_bytes_sent "$http_referer" '
-                     '"$http_user_agent" "$http_x_forwarded_for"';
-    access_log /var/log/nginx/access.log main;
-    sendfile on;
-    keepalive_timeout 65;
-
-    # WebSocket headers
-    map $http_upgrade $connection_upgrade {
-        default upgrade;
-        '' close;
-    }
-
-    upstream chat_backend {
-        # Random distribution (no sticky sessions)
-        server chat-service-1:8080;
-        server chat-service-2:8080;
-    }
-
-    server {
-        listen 80;
-
-        location / {
-            # For frontend static files - adjust as needed
-            root /usr/share/nginx/html;
-            index index.html;
-            try_files $uri $uri/ /index.html;
-        }
-
-        location /ws/ {
-            proxy_pass http://chat_backend;
-            proxy_http_version 1.1;
-            proxy_set_header Upgrade $http_upgrade;
-            proxy_set_header Connection $connection_upgrade;
-            proxy_set_header Host $host;
-            proxy_set_header X-Real-IP $remote_addr;
-            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-            
-            # These timeout settings are important for WebSockets
-            proxy_read_timeout 3600s;
-            proxy_send_timeout 3600s;
-        }
-
-        location /health {
-            # Health check endpoint
-            proxy_pass http://chat_backend;
-            proxy_http_version 1.1;
-            proxy_set_header Host $host;
-            proxy_set_header X-Real-IP $remote_addr;
-        }
-    }
-}
-
-// ./server.go
-package main
-
-import (
-	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -887,6 +113,7 @@ import (
 	"time"
 
 	"github.com/go-redis/redis/v8"
+	"github.com/golang-jwt/jwt/v4"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
 	"go.mongodb.org/mongo-driver/bson"
@@ -1051,101 +278,332 @@ func (s *Server) createMongoDBIndexes() error {
 
 func (s *Server) initRedisSubscriptions() error {
 	instanceChannel := fmt.Sprintf("instance:%s", s.instanceID)
-	s.redisPubSub = s.redisClient.Subscribe(s.ctx, instanceChannel, "global:notifications")
+	globalDisconnectChannel := "global:disconnect"
+	s.redisPubSub = s.redisClient.Subscribe(s.ctx, instanceChannel, "global:notifications", globalDisconnectChannel)
 	go s.handleRedisMessages()
-	log.Printf("Subscribed to Redis channels: %s, global:notifications", instanceChannel)
+	log.Printf("Subscribed to Redis channels: %s, global:notifications, %s", instanceChannel, globalDisconnectChannel)
 	return nil
 }
 
-func (s *Server) handleRedisMessages() {
-	for {
-		msg, err := s.redisPubSub.ReceiveMessage(s.ctx)
-		if err != nil {
-			if s.ctx.Err() != nil {
-				return
-			}
-			log.Printf("Error receiving Redis message: %v", err)
-			time.Sleep(100 * time.Millisecond)
-			continue
-		}
-		if msg.Channel == fmt.Sprintf("instance:%s", s.instanceID) {
-			var message map[string]interface{}
-			if err := json.Unmarshal([]byte(msg.Payload), &message); err != nil {
-				log.Printf("Error unmarshaling Redis message: %v", err)
-				continue
-			}
-			switch message["type"] {
-			case "forward_message":
-				recipientID := message["to"].(string)
-				payload := message["payload"].(string)
-				var msgPacket MessagePacket
-				if err := json.Unmarshal([]byte(payload), &msgPacket); err != nil {
-					log.Printf("Error unmarshaling forwarded message: %v", err)
-					continue
+// forceDisconnectClient actively terminates a specific connection ID for a user on the current instance.
+// It ensures only the targeted connection is affected.
+func (s *Server) forceDisconnectClient(userID, connectionIDToDisconnect string) {
+	s.connectionsMux.Lock()
+	clientToDisconnect, ok := s.connections[userID]
+
+	// CRITICAL CHECK: Only disconnect if the client exists AND the connection ID matches the target!
+	if ok && clientToDisconnect.ConnectionID == connectionIDToDisconnect {
+		log.Printf("Force disconnecting client: User %s, Conn %s", userID, connectionIDToDisconnect)
+		// Remove from map *before* closing channels/connections to prevent readPump/writePump
+		// from trying to unregister it again after we release the lock.
+		delete(s.connections, userID)
+		s.connectionsMux.Unlock() // Unlock *before* potentially blocking I/O operations
+
+		// Close the send channel first - signals writePump to exit. Check if already closed.
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("Recovered from panic closing send channel for %s (%s): %v", userID, connectionIDToDisconnect, r)
 				}
-				s.connectionsMux.RLock()
-				recipient, ok := s.connections[recipientID]
-				s.connectionsMux.RUnlock()
-				if ok && recipient.IsConnected {
-					recipient.Send <- []byte(payload)
-					s.sendMessageAck(msgPacket.ID, recipientID, msgPacket.From, "delivered")
+			}()
+			// Check if channel is non-nil and not already closed
+			// A simple non-blocking read check isn't foolproof for detecting closure
+			// A robust way is difficult without extra state, rely on recover for safety
+			// If Send is guaranteed non-nil by constructor:
+			// close(clientToDisconnect.Send)
+			// Safer approach if Send could be nil or closed elsewhere:
+			select {
+			case _, chanOk := <-clientToDisconnect.Send:
+				if chanOk {
+					// Channel was open and had something (unlikely), or was just closed by another goroutine
+					// Re-check or assume closed now
 				} else {
-					s.storePendingMessage(msgPacket)
+					// Channel was already closed
+					log.Printf("Send channel for %s (%s) was already closed.", userID, connectionIDToDisconnect)
+					return // Already closed
 				}
+			default:
+				// Channel is open and empty, or nil. Assume open/nil and try closing.
+				// Need to be careful if nil is possible. Let's assume constructor ensures non-nil.
+				close(clientToDisconnect.Send)
+				log.Printf("Closed send channel for %s (%s)", userID, connectionIDToDisconnect)
+			}
+		}()
 
-			case "forward_group_message":
-				groupID := message["group_id"].(string)
-				payload := message["payload"].(string)
-				// Either use the members variable or don't declare it
-				members, ok := message["members"].([]interface{})
-				if !ok {
-					log.Printf("Error: invalid or missing members for group %s", groupID)
+		// Close the WebSocket connection - signals readPump to exit.
+		err := clientToDisconnect.Connection.Close()
+		if err != nil {
+			// Log error, but proceed with cleanup. Might be already closed by client.
+			log.Printf("Error closing websocket connection for %s (%s): %v", userID, connectionIDToDisconnect, err)
+		}
+
+		// Clean up connection-specific Redis key (if it exists)
+		connInfoKey := fmt.Sprintf("conn:%s", connectionIDToDisconnect)
+		deletedCount, delErr := s.redisClient.Del(s.ctx, connInfoKey).Result()
+		if delErr != nil {
+			log.Printf("WARN: Failed to delete Redis key %s during force disconnect: %v", connInfoKey, delErr)
+		} else if deletedCount > 0 {
+			log.Printf("Deleted Redis key %s", connInfoKey)
+		}
+
+		log.Printf("Forced disconnect completed for User %s, Conn %s", userID, connectionIDToDisconnect)
+
+	} else {
+		// The client wasn't found, or the connection ID didn't match.
+		s.connectionsMux.Unlock() // Unlock if no action taken
+		if ok {
+			// Found a client for the user, but the connection ID was different.
+			log.Printf("Disconnect request for User %s, Conn %s ignored: Found different Conn %s locally.", userID, connectionIDToDisconnect, clientToDisconnect.ConnectionID)
+		} else {
+			// User wasn't even in the local map.
+			log.Printf("Disconnect request for User %s, Conn %s ignored: User not found locally.", userID, connectionIDToDisconnect)
+		}
+	}
+}
+
+func (s *Server) handleRedisMessages() {
+	ch := s.redisPubSub.Channel() // Use Channel() for better control
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			log.Println("Redis PubSub handler stopping.")
+			err := s.redisPubSub.Close() // Ensure pubsub is closed on shutdown
+			if err != nil {
+				log.Printf("Error closing Redis PubSub: %v", err)
+			}
+			return
+		case msg := <-ch:
+			if msg == nil {
+				// This case typically occurs if the PubSub connection is closed externally or encounters a severe error.
+				log.Println("Redis PubSub channel returned nil message. Attempting to re-subscribe...")
+				// Optional: Add logic to attempt re-subscription with backoff
+				time.Sleep(5 * time.Second) // Prevent tight loop on persistent error
+				// Re-initialize subscription
+				err := s.initRedisSubscriptions()
+				if err != nil {
+					log.Printf("FATAL: Failed to re-subscribe to Redis after channel closure: %v", err)
+					// Consider shutting down the server instance if Redis is critical and cannot reconnect
+					s.Shutdown() // Or trigger a more graceful shutdown sequence
+				} else {
+					log.Println("Successfully re-subscribed to Redis.")
+					// Important: The old goroutine exits here, a new one is started by initRedisSubscriptions
+					return
+				}
+			}
+
+			// Handle instance-specific messages (forwarding, disconnects)
+			if msg.Channel == fmt.Sprintf("instance:%s", s.instanceID) {
+				var message map[string]interface{}
+				if err := json.Unmarshal([]byte(msg.Payload), &message); err != nil {
+					log.Printf("Error unmarshaling Redis instance message payload '%s': %v", msg.Payload, err)
 					continue
 				}
 
-				var msgPacket MessagePacket
-				if err := json.Unmarshal([]byte(payload), &msgPacket); err != nil {
-					log.Printf("Error unmarshaling group message for group %s: %v", groupID, err)
+				messageType, typeOk := message["type"].(string)
+				if !typeOk {
+					log.Printf("Received Redis message on instance channel without 'type' field: %+v", message)
 					continue
 				}
 
-				// Process the group message and deliver to members
-				for _, member := range members {
-					memberID, ok := member.(string)
-					if !ok {
+				switch messageType {
+				case "forward_message":
+					recipientID, okTo := message["to"].(string)
+					payload, okPayload := message["payload"].(string)
+					if !okTo || !okPayload {
+						log.Printf("Invalid 'forward_message' format: %+v", message)
+						continue
+					}
+
+					var msgPacket MessagePacket
+					if err := json.Unmarshal([]byte(payload), &msgPacket); err != nil {
+						log.Printf("Error unmarshaling forwarded message payload: %v", err)
+						continue
+					}
+					s.connectionsMux.RLock()
+					recipient, ok := s.connections[recipientID]
+					s.connectionsMux.RUnlock()
+					if ok && recipient.IsConnected {
+						// Use non-blocking send to prevent deadlock if client channel is full
+						select {
+						case recipient.Send <- []byte(payload):
+							s.sendMessageAck(msgPacket.ID, recipientID, msgPacket.From, "delivered")
+						default:
+							log.Printf("WARN: Send channel full for user %s (Conn %s), dropping forwarded message %s", recipientID, recipient.ConnectionID, msgPacket.ID)
+							// Consider alternative handling for full buffers (e.g., requeueing, notifying sender)
+						}
+					} else {
+						log.Printf("User %s not found locally for forwarded message %s, might be offline or disconnected", recipientID, msgPacket.ID)
+					}
+
+				case "forward_group_message":
+					groupID, okGroup := message["group_id"].(string)
+					payload, okPayload := message["payload"].(string)
+					membersPayload, okMembers := message["members"]
+					if !okGroup || !okPayload || !okMembers {
+						log.Printf("Invalid 'forward_group_message' format: %+v", message)
+						continue
+					}
+
+					var members []string
+					if membersInterface, ok := membersPayload.([]interface{}); ok {
+						for _, m := range membersInterface {
+							if memberStr, okStr := m.(string); okStr {
+								members = append(members, memberStr)
+							} else {
+								log.Printf("WARN: Non-string member found in forward_group_message members list: %v", m)
+							}
+						}
+					} else {
+						log.Printf("Error: invalid members type (%T) in forward_group_message for group %s", membersPayload, groupID)
+						continue
+					}
+
+					if len(members) == 0 {
+						log.Printf("WARN: Received forward_group_message for group %s with empty resolved members list.", groupID)
+						continue // No one on this instance to send to
+					}
+
+					var msgPacket MessagePacket
+					if err := json.Unmarshal([]byte(payload), &msgPacket); err != nil {
+						log.Printf("Error unmarshaling forwarded group message payload for group %s: %v", groupID, err)
+						continue
+					}
+
+					for _, memberID := range members {
+						s.connectionsMux.RLock()
+						recipient, ok := s.connections[memberID]
+						s.connectionsMux.RUnlock() // Unlock inside loop after check
+						if ok && recipient.IsConnected {
+							// Use non-blocking send
+							select {
+							case recipient.Send <- []byte(payload):
+								s.sendMessageAck(msgPacket.ID, memberID, msgPacket.From, "delivered")
+							default:
+								log.Printf("WARN: Send channel full for user %s (Conn %s), dropping forwarded group message %s", memberID, recipient.ConnectionID, msgPacket.ID)
+							}
+						} else {
+							// This is expected if the member disconnected just after the routing decision was made
+							log.Printf("User %s not found locally for forwarded group message %s", memberID, msgPacket.ID)
+						}
+					}
+
+				case "forward_notification":
+					toUserID, okTo := message["to"].(string)
+					payload, okPayload := message["payload"].(string)
+					if !okTo || !okPayload {
+						log.Printf("Invalid 'forward_notification' format: %+v", message)
 						continue
 					}
 
 					s.connectionsMux.RLock()
-					recipient, ok := s.connections[memberID]
+					client, ok := s.connections[toUserID]
 					s.connectionsMux.RUnlock()
-
-					if ok && recipient.IsConnected {
-						recipient.Send <- []byte(payload)
-						s.sendMessageAck(msgPacket.ID, memberID, msgPacket.From, "delivered")
+					if ok && client.IsConnected {
+						select {
+						case client.Send <- []byte(payload):
+							// Notification sent
+						default:
+							log.Printf("WARN: Send channel full for user %s (Conn %s), dropping forwarded notification", toUserID, client.ConnectionID)
+						}
 					} else {
-						// Store as pending for this member
-						s.storePendingMessage(msgPacket)
+						log.Printf("User %s not found locally for forwarded notification", toUserID)
 					}
-				}
 
-			case "forward_notification":
-				toUserID := message["to"].(string)
-				payload := message["payload"].(string)
-				s.connectionsMux.RLock()
-				client, ok := s.connections[toUserID]
-				s.connectionsMux.RUnlock()
-				if ok && client.IsConnected {
-					client.Send <- []byte(payload)
-				}
-			case "message_ack":
-				messageID := message["message_id"].(string)
-				userID := message["from"].(string)
-				status := message["status"].(string)
-				s.processAcknowledgment(messageID, userID, status)
+				case "disconnect_user":
+					userID, okUser := message["user_id"].(string)
+					connIDToDisconnect, okConn := message["connection_id"].(string)
+					if okUser && okConn {
+						log.Printf("Received request to disconnect User %s (Conn %s) on this instance", userID, connIDToDisconnect)
+						s.forceDisconnectClient(userID, connIDToDisconnect)
+					} else {
+						log.Printf("Error parsing disconnect_user message: %+v", message)
+					}
+
+				case "forward_typing":
+					toUserID, okTo := message["to"].(string)
+					payload, okPayload := message["payload"].(string)
+					// fromUserID might also be useful for context, though not strictly needed to forward
+					// fromUserID, _ := message["from"].(string)
+					if !okTo || !okPayload {
+						log.Printf("Invalid 'forward_typing' format: %+v", message)
+						continue
+					}
+					s.connectionsMux.RLock()
+					recipient, ok := s.connections[toUserID]
+					s.connectionsMux.RUnlock()
+					if ok && recipient.IsConnected {
+						select {
+						case recipient.Send <- []byte(payload):
+							// Typing indicator sent
+						default:
+							log.Printf("WARN: Send channel full for user %s (Conn %s), dropping forwarded typing indicator", toUserID, recipient.ConnectionID)
+						}
+					}
+
+				case "forward_group_typing":
+					groupID, okGroup := message["group_id"].(string)
+					payload, okPayload := message["payload"].(string)
+					membersPayload, okMembers := message["members"]
+					// fromUserID, _ := message["from"].(string) // Optional context
+					if !okGroup || !okPayload || !okMembers {
+						log.Printf("Invalid 'forward_group_typing' format: %+v", message)
+						continue
+					}
+
+					var members []string
+					if membersInterface, ok := membersPayload.([]interface{}); ok {
+						for _, m := range membersInterface {
+							if memberStr, okStr := m.(string); okStr {
+								members = append(members, memberStr)
+							}
+						}
+					} else {
+						log.Printf("Error: invalid members type (%T) in forward_group_typing for group %s", membersPayload, groupID)
+						continue
+					}
+
+					if len(members) == 0 {
+						continue
+					}
+
+					for _, memberID := range members {
+						s.connectionsMux.RLock()
+						recipient, ok := s.connections[memberID]
+						s.connectionsMux.RUnlock()
+						if ok && recipient.IsConnected {
+							select {
+							case recipient.Send <- []byte(payload):
+								// Group typing indicator sent
+							default:
+								log.Printf("WARN: Send channel full for user %s (Conn %s), dropping forwarded group typing indicator", memberID, recipient.ConnectionID)
+							}
+						}
+					}
+
+				default:
+					log.Printf("Received unknown message type '%s' on instance channel: %+v", messageType, message)
+
+				} // end switch messageType
+
+			} else if msg.Channel == "global:notifications" {
+				// Handle global notifications if necessary
+				log.Printf("Received global notification: %s", msg.Payload)
+				// Example: Propagate to all clients on this instance if needed
+				// s.connectionsMux.RLock()
+				// for _, client := range s.connections {
+				//  select {
+				//  case client.Send <- []byte(msg.Payload):
+				//  default: log.Printf("WARN: Send channel full for user %s during global notification broadcast", client.UserID)
+				//  }
+				// }
+				// s.connectionsMux.RUnlock()
+
+			} else {
+				log.Printf("Received message on unexpected Redis channel: %s", msg.Channel)
 			}
-		}
-	}
+		} // end select
+	} // end for
 }
 
 func (s *Server) registerInstance() error {
@@ -1177,16 +635,39 @@ func (s *Server) RegisterRoutes(router *mux.Router) {
 
 func (s *Server) handleWebSocketConnection(w http.ResponseWriter, r *http.Request) {
 	userID := r.URL.Query().Get("user_id")
-	if userID == "" {
-		http.Error(w, "Missing user_id", http.StatusBadRequest)
+	tokenStr := r.URL.Query().Get("token")
+
+	if userID == "" || tokenStr == "" {
+		http.Error(w, "Missing user_id or token", http.StatusUnauthorized)
 		return
 	}
+
+	// Parse and verify the JWT
+	claims := &jwt.MapClaims{}
+	token, err := jwt.ParseWithClaims(tokenStr, claims, func(token *jwt.Token) (interface{}, error) {
+		return []byte(os.Getenv("ACCESS_TOKEN_SECRET")), nil
+	})
+	if err != nil || !token.Valid {
+		http.Error(w, "Invalid or expired token", http.StatusUnauthorized)
+		return
+	}
+
+	// Extract email from token and ensure it matches the provided user_id
+	email, ok := (*claims)["email"].(string)
+	if !ok || email != userID {
+		http.Error(w, "Token email does not match user_id", http.StatusUnauthorized)
+		return
+	}
+
+	// Upgrade the connection
 	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("Error upgrading connection: %v", err)
 		return
 	}
-	client := NewClient(userID, conn, s)
+
+	// Create client with the token
+	client := NewClient(userID, conn, s, tokenStr)
 	s.registerClient(client)
 	s.deliverPendingMessages(client)
 	s.loadUserGroups(client)
@@ -1234,41 +715,296 @@ func (s *Server) handleHealthCheck(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) registerClient(client *Client) {
-	s.connectionsMux.Lock()
-	defer s.connectionsMux.Unlock()
-	if existing, ok := s.connections[client.UserID]; ok {
-		existing.Connection.Close()
-		delete(s.connections, client.UserID)
-	}
-	s.connections[client.UserID] = client
+	userID := client.UserID
+	newConnectionID := client.ConnectionID
+	newInstanceID := s.instanceID
+	userConnKey := fmt.Sprintf("user:%s:conn", userID)
+	userInstanceKey := fmt.Sprintf("user:%s:instance", userID)
+	connInfoKey := fmt.Sprintf("conn:%s", newConnectionID)
+	presenceKey := fmt.Sprintf("user:%s:presence", userID)
+	lastSeenKey := fmt.Sprintf("user:%s:last_seen", userID)
+
+	log.Printf("Attempting to register client: User %s, New Conn %s, Instance %s", userID, newConnectionID, newInstanceID)
+
+	// --- Atomically update Redis and get previous connection info ---
+	pipe := s.redisClient.Pipeline()
+	prevConnIDCmd := pipe.GetSet(s.ctx, userConnKey, newConnectionID)
+	prevInstanceIDCmd := pipe.GetSet(s.ctx, userInstanceKey, newInstanceID)
+	// Set initial connection info with expiration
+	client.connInfo.InstanceID = newInstanceID // Ensure connInfo has the correct instance ID before saving
 	connectionData, _ := json.Marshal(client.connInfo)
-	s.redisClient.Set(s.ctx, fmt.Sprintf("conn:%s", client.ConnectionID), connectionData, 24*time.Hour)
-	s.redisClient.Set(s.ctx, fmt.Sprintf("user:%s:conn", client.UserID), client.ConnectionID, 24*time.Hour)
-	s.redisClient.Set(s.ctx, fmt.Sprintf("user:%s:instance", client.UserID), s.instanceID, 24*time.Hour)
-	s.updateUserPresenceState(client.UserID, true)
-	log.Printf("Client registered: %s (connection %s)", client.UserID, client.ConnectionID)
+	pipe.Set(s.ctx, connInfoKey, connectionData, 24*time.Hour)
+	// Set initial presence
+	pipe.Set(s.ctx, presenceKey, "online", 24*time.Hour)
+	pipe.Set(s.ctx, lastSeenKey, time.Now().Unix(), 24*time.Hour)
+
+	// Execute the pipeline
+	_, execErr := pipe.Exec(s.ctx) // Rename err to execErr to avoid confusion later
+
+	// --- MODIFIED ERROR HANDLING for pipe.Exec ---
+	if execErr != nil {
+		if errors.Is(execErr, redis.Nil) {
+			// Treat redis.Nil from Exec as a WARNING, not a fatal error for the pipeline itself.
+			// This might indicate non-existent keys were GetSet, which is expected for new users.
+			// We will proceed to check individual command results.
+			log.Printf("WARN: Redis pipeline Exec returned redis.Nil for User %s, Conn %s. Proceeding to check individual command results. Error: %v", userID, newConnectionID, execErr)
+		} else {
+			// For any other error from Exec (network, transaction error), treat it as fatal.
+			log.Printf("ERROR: Redis pipeline Exec failed during registration for User %s, Conn %s: %v", userID, newConnectionID, execErr)
+			client.Connection.Close() // Close the new connection
+			// Attempt to clean up the potentially half-set keys (best effort)
+			_, delErr := s.redisClient.Del(s.ctx, userConnKey, userInstanceKey, connInfoKey, presenceKey, lastSeenKey).Result()
+			if delErr != nil {
+				log.Printf("WARN: Failed to cleanup keys after pipeline Exec error for user %s: %v", userID, delErr)
+			}
+			return // Stop registration
+		}
+	}
+	// --- END MODIFIED ERROR HANDLING ---
+
+	// Now check the results from the individual commands within the pipeline
+	prevConnID, errConn := prevConnIDCmd.Result()
+	isNilConnErr := errors.Is(errConn, redis.Nil) // Check if the key didn't exist before GetSet
+	if errConn != nil && !isNilConnErr {
+		// Log error if GetSet failed for a reason other than Nil
+		log.Printf("ERROR: Failed to get previous connection ID result from Redis pipeline for User %s: %v. State might be inconsistent.", userID, errConn)
+		// Consider if this warrants closing the connection - depends on how critical GetSet success is.
+		// For now, log and continue, as other parts of the pipeline likely succeeded.
+	}
+
+	prevInstanceID, errInstance := prevInstanceIDCmd.Result()
+	isNilInstanceErr := errors.Is(errInstance, redis.Nil)
+	if errInstance != nil && !isNilInstanceErr {
+		// Log error if GetSet failed for a reason other than Nil
+		log.Printf("ERROR: Failed to get previous instance ID result from Redis pipeline for User %s: %v. State might be inconsistent.", userID, errInstance)
+	}
+
+	// Log results (even if there were non-fatal errors getting them)
+	log.Printf("Redis GETSET results: Prev Conn '%s' (Nil err: %v), Prev Instance '%s' (Nil err: %v)",
+		prevConnID, isNilConnErr, prevInstanceID, isNilInstanceErr)
+
+	// --- Handle the previous connection ---
+	// Only proceed if there *was* a previous connection ID returned (errConn is nil or redis.Nil),
+	// and it's different from the new one.
+	if (errConn == nil || isNilConnErr) && prevConnID != "" && prevConnID != newConnectionID {
+		log.Printf("Found previous connection: User %s, Conn %s, Instance %s", userID, prevConnID, prevInstanceID)
+
+		// Determine where the previous connection was
+		// Use the retrieved prevInstanceID. Check errInstance as well for robustness.
+		if prevInstanceID == newInstanceID && (errInstance == nil || isNilInstanceErr) {
+			// Previous connection was on THIS instance
+			log.Printf("Previous connection for %s (%s) was on this instance. Forcing disconnect.", userID, prevConnID)
+			s.forceDisconnectClient(userID, prevConnID)
+		} else if prevInstanceID != "" && (errInstance == nil || isNilInstanceErr) {
+			// Previous connection was on a DIFFERENT, known instance
+			log.Printf("Previous connection for %s (%s) was on different instance (%s). Sending disconnect signal.", userID, prevConnID, prevInstanceID)
+			disconnectMsg := map[string]interface{}{
+				"type":          "disconnect_user",
+				"user_id":       userID,
+				"connection_id": prevConnID,
+			}
+			payload, _ := json.Marshal(disconnectMsg)
+			targetInstanceChannel := fmt.Sprintf("instance:%s", prevInstanceID)
+			errPub := s.redisClient.Publish(s.ctx, targetInstanceChannel, payload).Err()
+			if errPub != nil {
+				log.Printf("ERROR: Failed to publish disconnect signal to instance %s channel %s: %v", prevInstanceID, targetInstanceChannel, errPub)
+			}
+		} else {
+			// Previous connection ID existed, but instance ID was missing, redis.Nil, or had another error.
+			log.Printf("WARNING: Found previous connection ID %s for user %s, but previous instance ID was '%s' (Instance Err: %v). Attempting local disconnect and Redis cleanup.", prevConnID, userID, prevInstanceID, errInstance)
+			// Attempt local disconnect as a fallback.
+			s.forceDisconnectClient(userID, prevConnID)
+			// Also, explicitly delete the potentially orphaned conn info key in Redis for the old connection.
+			_, delErr := s.redisClient.Del(s.ctx, fmt.Sprintf("conn:%s", prevConnID)).Result()
+			if delErr != nil {
+				log.Printf("WARN: Failed to delete orphaned conn key %s for user %s: %v", prevConnID, userID, delErr)
+			}
+		}
+	} else if (errConn == nil || isNilConnErr) && prevConnID == newConnectionID {
+		// This case means GetSet returned the *same* ID we just set. Should be rare with UUIDs.
+		log.Printf("INFO: Previous connection ID %s is the same as the new one for user %s. No disconnect action needed.", prevConnID, userID)
+	}
+
+	// --- Register the NEW client locally in the map ---
+	s.connectionsMux.Lock()
+	existingClient, exists := s.connections[userID]
+	if exists && existingClient.ConnectionID != newConnectionID {
+		log.Printf("WARNING: Stale client %s found in local map for user %s during registration of %s. Closing stale local client.", existingClient.ConnectionID, userID, newConnectionID)
+		staleClient := existingClient
+		delete(s.connections, userID)
+		s.connectionsMux.Unlock()
+
+		// Close resources outside lock
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("Recovered from panic closing stale client send channel for %s (%s): %v", userID, staleClient.ConnectionID, r)
+				}
+			}()
+			close(staleClient.Send)
+		}()
+		staleClient.Connection.Close()
+
+		s.connectionsMux.Lock() // Re-acquire lock
+		s.connections[userID] = client
+		s.connectionsMux.Unlock()
+
+	} else {
+		// No existing client, or existing client IS the new one (harmless overwrite).
+		if exists {
+			log.Printf("INFO: Client %s for user %s already in map during registration. Overwriting.", newConnectionID, userID)
+		}
+		s.connections[userID] = client
+		s.connectionsMux.Unlock()
+	}
+
+	log.Printf("Client registered successfully: User %s, Conn %s, Instance %s", userID, newConnectionID, newInstanceID)
+	// Note: Presence, connection info, user:conn, user:instance keys were set/updated in the pipeline.
 }
 
 func (s *Server) unregisterClient(client *Client) {
+	userID := client.UserID
+	connID := client.ConnectionID // The ID of the connection triggering this unregister
+
+	log.Printf("Unregistering client: User %s, Conn %s", userID, connID)
+
+	// --- Local Map Cleanup ---
 	s.connectionsMux.Lock()
-	defer s.connectionsMux.Unlock()
-	if c, ok := s.connections[client.UserID]; ok && c == client {
-		delete(s.connections, client.UserID)
-		close(client.Send)
+	// Verify that the client being unregistered is *still* the one in the map for this user.
+	// This prevents accidentally removing a *newer* client if a disconnect/reconnect race occurred,
+	// and the readPump for the *old* connection exits slightly later.
+	registeredClient, ok := s.connections[userID]
+	if ok && registeredClient.ConnectionID == connID {
+		// It's the correct client, remove it from the map.
+		log.Printf("Removing client %s (%s) from local map.", userID, connID)
+		delete(s.connections, userID)
+		s.connectionsMux.Unlock() // Unlock after modifying map
+
+		// Close the send channel *after* removing from map to prevent new writes. Check if already closed.
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("Recovered from panic closing send channel during unregister for %s (%s): %v", userID, connID, r)
+				}
+			}()
+			// Assume channel is non-nil from constructor, attempt close. Recover handles double close.
+			// More robust check omitted for brevity, rely on recover.
+			close(client.Send)
+			log.Printf("Closed send channel during unregister for %s (%s)", userID, connID)
+		}()
+
+	} else {
+		// The client in the map is different or doesn't exist. Don't remove it.
+		s.connectionsMux.Unlock() // Unlock as we didn't modify the map
+		if ok {
+			log.Printf("Skipping removal of %s (%s) from map during unregister: Found different connection %s.", userID, connID, registeredClient.ConnectionID)
+		} else {
+			log.Printf("Skipping removal of %s (%s) from map during unregister: User not found.", userID, connID)
+		}
+		// If the client isn't the one in the map, we MUST NOT proceed with Redis cleanup below,
+		// as doing so could interfere with the state of the currently active connection.
+		// Also, don't close the Send channel of the passed 'client' object if it wasn't the registered one.
+		log.Printf("Unregister finished early for %s (%s) as it was not the active client in the map.", userID, connID)
+		return // Exit the function early
 	}
+
+	// --- Update Local Client State (Optional) ---
+	// This client object is now effectively dead.
 	client.IsConnected = false
-	client.updateConnectionInfo()
-	s.redisClient.Del(s.ctx, fmt.Sprintf("user:%s:instance", client.UserID))
-	s.updateUserPresenceState(client.UserID, false)
-	log.Printf("Client unregistered: %s", client.UserID)
+
+	// --- Conditional Redis Cleanup ---
+	// Only clear the user-level Redis keys (instance, presence) if THIS connection
+	// (`connID`) is still the "active" one according to the `user:<userID>:conn` key in Redis.
+	// This prevents an old, slow unregister call from wiping the state set by a newer connection.
+	userConnKey := fmt.Sprintf("user:%s:conn", userID)
+	currentConnIDInRedis, err := s.redisClient.Get(s.ctx, userConnKey).Result()
+
+	if err == nil && currentConnIDInRedis == connID {
+		// This connection IS still the active one in Redis. Perform cleanup.
+		log.Printf("Client %s (%s) is still the active one in Redis. Clearing instance/presence.", userID, connID)
+		pipe := s.redisClient.Pipeline()
+		pipe.Del(s.ctx, fmt.Sprintf("user:%s:instance", userID))
+		// Set presence to offline and update last seen one last time
+		pipe.Set(s.ctx, fmt.Sprintf("user:%s:presence", userID), "offline", 24*time.Hour)
+		pipe.Set(s.ctx, fmt.Sprintf("user:%s:last_seen", userID), time.Now().Unix(), 24*time.Hour)
+		// We can also delete the user:conn key now that we know it matched and we're cleaning up
+		pipe.Del(s.ctx, userConnKey)
+
+		_, pipeErr := pipe.Exec(s.ctx)
+		if pipeErr != nil {
+			log.Printf("WARN: Redis pipeline failed during conditional cleanup for %s (%s): %v", userID, connID, pipeErr)
+		} else {
+			log.Printf("Cleared instance/presence/conn keys in Redis for %s (%s).", userID, connID)
+		}
+
+	} else if errors.Is(err, redis.Nil) {
+		// The user:conn key doesn't exist in Redis at all. This implies cleanup might have already happened
+		// or the user never fully registered. Ensure presence is marked offline just in case.
+		log.Printf("No active connection found in Redis for %s during unregister of %s. Ensuring presence is offline.", userID, connID)
+		pipe := s.redisClient.Pipeline()
+		pipe.Set(s.ctx, fmt.Sprintf("user:%s:presence", userID), "offline", 24*time.Hour)
+		pipe.Set(s.ctx, fmt.Sprintf("user:%s:last_seen", userID), time.Now().Unix(), 24*time.Hour)
+		// If instance key exists without conn key, remove it
+		pipe.Del(s.ctx, fmt.Sprintf("user:%s:instance", userID))
+		_, pipeErr := pipe.Exec(s.ctx)
+		if pipeErr != nil {
+			log.Printf("WARN: Redis pipeline failed during Nil-conn cleanup for %s (%s): %v", userID, connID, pipeErr)
+		}
+
+	} else if err != nil {
+		// Failed to check Redis, log the error but don't attempt cleanup without knowing the state.
+		log.Printf("WARN: Failed to check current Redis connection for %s during unregister of %s: %v. Skipping Redis user-level cleanup.", userID, connID, err)
+	} else {
+		// The connection ID in Redis (currentConnIDInRedis) does NOT match the one being unregistered (connID).
+		// This means a newer connection is already active. DO NOT touch the shared user keys.
+		log.Printf("Skipping Redis user-level cleanup for %s (%s): Newer connection %s is active.", userID, connID, currentConnIDInRedis)
+	}
+
+	// --- Always Clean Up Connection-Specific Redis Key ---
+	// Regardless of whether it was the active connection, the specific `conn:<connID>` key should be removed.
+	connInfoKey := fmt.Sprintf("conn:%s", connID)
+	deletedCount, delErr := s.redisClient.Del(s.ctx, connInfoKey).Result()
+	if delErr != nil {
+		log.Printf("WARN: Failed to delete Redis key %s during unregister: %v", connInfoKey, delErr)
+	} else if deletedCount > 0 {
+		log.Printf("Deleted connection-specific Redis key %s", connInfoKey)
+	}
+
+	log.Printf("Client unregister process finished for: User %s, Conn %s", userID, connID)
 }
 
+// updateConnectionInfo updates secondary details like last_seen, last_sequence, and the specific connection info key in Redis.
+// It should NOT modify the primary user:instance or user:presence keys, which are handled by register/unregister.
 func (s *Server) updateConnectionInfo(connInfo UserConnection) {
-	connectionData, _ := json.Marshal(connInfo)
-	s.redisClient.Set(s.ctx, fmt.Sprintf("conn:%s", connInfo.ConnectionID), connectionData, 24*time.Hour)
-	s.redisClient.Set(s.ctx, fmt.Sprintf("user:%s:last_seen", connInfo.UserID), connInfo.LastSeen.Unix(), 24*time.Hour)
-	if connInfo.LastSequence > 0 {
-		s.redisClient.Set(s.ctx, fmt.Sprintf("user:%s:last_seq", connInfo.UserID), connInfo.LastSequence, 24*time.Hour)
+	// Ensure the connection info object itself is up-to-date before marshaling
+	connInfo.LastSeen = time.Now() // Update LastSeen right before saving
+	connInfo.Connected = true      // Assume still connected if this is called from activity
+
+	connectionData, err := json.Marshal(connInfo)
+	if err != nil {
+		log.Printf("ERROR: Failed to marshal connection info for Conn %s: %v", connInfo.ConnectionID, err)
+		return
+	}
+
+	// Update connection specific details with expiration
+	connInfoKey := fmt.Sprintf("conn:%s", connInfo.ConnectionID)
+	// Update user-level details (last seen, sequence) - Use Pipelining
+	userLastSeenKey := fmt.Sprintf("user:%s:last_seen", connInfo.UserID)
+	userLastSeqKey := fmt.Sprintf("user:%s:last_seq", connInfo.UserID)
+
+	pipe := s.redisClient.Pipeline()
+	pipe.Set(s.ctx, connInfoKey, connectionData, 24*time.Hour)
+	pipe.Set(s.ctx, userLastSeenKey, connInfo.LastSeen.Unix(), 24*time.Hour)
+	if connInfo.LastSequence > 0 { // Only update sequence if it's meaningful
+		pipe.Set(s.ctx, userLastSeqKey, connInfo.LastSequence, 24*time.Hour)
+	}
+
+	// Optionally update presence ONLY if setting to 'online' (but register/unregister are primary)
+	// pipe.Set(s.ctx, fmt.Sprintf("user:%s:presence", connInfo.UserID), "online", 24*time.Hour)
+
+	_, pipeErr := pipe.Exec(s.ctx)
+	if pipeErr != nil {
+		log.Printf("WARN: Error executing pipeline for updateConnectionInfo for user %s, conn %s: %v", connInfo.UserID, connInfo.ConnectionID, pipeErr)
 	}
 }
 
@@ -1771,23 +1507,46 @@ func (s *Server) routeGroupTypingIndicator(fromUserID, groupID string, notificat
 	}
 }
 
+// updateUserPresenceState updates the user's presence status ('online'/'offline') and last_seen time in Redis.
+// It's called during registration, unregistration, and potentially periodic heartbeats.
 func (s *Server) updateUserPresenceState(userID string, isOnline bool) {
-	status := "online"
-	if !isOnline {
-		status = "offline"
+	status := "offline"
+	if isOnline {
+		status = "online"
 	}
 	presenceKey := fmt.Sprintf("user:%s:presence", userID)
 	lastSeenKey := fmt.Sprintf("user:%s:last_seen", userID)
-	now := time.Now()
+
+	// Get current time for last_seen
+	now := time.Now().Unix()
+
+	// Use a pipeline to set both keys atomically (relative to Redis execution)
 	pipe := s.redisClient.Pipeline()
-	pipe.Set(s.ctx, presenceKey, status, 24*time.Hour)
-	pipe.Set(s.ctx, lastSeenKey, now.Unix(), 24*time.Hour)
-	if isOnline {
-		pipe.Set(s.ctx, fmt.Sprintf("user:%s:instance", userID), s.instanceID, 24*time.Hour)
+	pipe.Set(s.ctx, presenceKey, status, 24*time.Hour) // Set presence with expiration
+	pipe.Set(s.ctx, lastSeenKey, now, 24*time.Hour)    // Update last_seen with expiration
+
+	// Execute the pipeline
+	_, err := pipe.Exec(s.ctx)
+	if err != nil {
+		log.Printf("WARN: Error executing Redis pipeline for updateUserPresenceState for user %s to %s: %v", userID, status, err)
 	} else {
-		pipe.Del(s.ctx, fmt.Sprintf("user:%s:instance", userID))
+		log.Printf("Updated presence for user %s to %s (Last Seen: %d)", userID, status, now)
 	}
-	pipe.Exec(s.ctx)
+
+	// Optional: Broadcast presence change via Pub/Sub if needed by other services/clients
+	/*
+		presenceUpdate := map[string]interface{}{
+		    "type": "presence_update",
+		    "user_id": userID,
+		    "status": status,
+		    "last_seen": now,
+		}
+		payload, _ := json.Marshal(presenceUpdate)
+		errPub := s.redisClient.Publish(s.ctx, "global:presence", payload).Err()
+		if errPub != nil {
+		    log.Printf("WARN: Failed to publish presence update for user %s: %v", userID, errPub)
+		}
+	*/
 }
 
 func (s *Server) handleOnlineStatusCheck(client *Client, targetUserID string) {
@@ -1921,71 +1680,690 @@ func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(version)
 }
 
+./message.go
+package main
 
-// ./wobichat-task.json
-{
-    "family": "wobichat-task",
-    "networkMode": "awsvpc",
-    "requiresCompatibilities": ["FARGATE"],
-    "cpu": "512",
-    "memory": "1024",
-    "executionRoleArn": "arn:aws:iam::754590379920:role/ecsTaskExecutionRole",
-    "containerDefinitions": [
-      {
-        "name": "chat-service",
-        "image": "754590379920.dkr.ecr.ap-southeast-2.amazonaws.com/wobichat/chat-service:latest",
-        "portMappings": [
-          {
-            "containerPort": 8080,
-            "protocol": "tcp"
-          }
-        ],
-        "environment": [
-          {
-            "name": "KAFKA_BOOTSTRAP_SERVERS",
-            "value": "pkc-921jm.us-east-2.aws.confluent.cloud:9092"
-          },
-          {
-            "name": "KAFKA_API_KEY",
-            "value": "JUHXV3WXBZE4XCJ6"
-          },
-          {
-            "name": "KAFKA_API_SECRET",
-            "value": "fEdbPtUfESqBhNjIecbIphJbTNz9Y3kQlGoKe+Av3aLG0p/zMXdzuhpAkiwifWK7"
-          },
-          {
-            "name": "REDIS_HOST",
-            "value": "redis-16702.c124.us-central1-1.gce.redns.redis-cloud.com"
-          },
-          {
-            "name": "REDIS_PORT",
-            "value": "16702"
-          },
-          {
-            "name": "REDIS_USERNAME",
-            "value": "default"
-          },
-          {
-            "name": "REDIS_PASSWORD",
-            "value": "C9vQpbNP9YqVj1OeHmXTpCxlDKk4TxA0"
-          },
-          {
-            "name": "MONGO_URI",
-            "value": "mongodb+srv://sehej:Passw0rd942@wobitech.n7ilc.mongodb.net/wobichat-db?retryWrites=true&w=majority&appName=wobitech"
-          },
-          {
-            "name": "PORT",
-            "value": "8080"
-          }
-        ],
-        "logConfiguration": {
-          "logDriver": "awslogs",
-          "options": {
-            "awslogs-group": "/ecs/wobichat",
-            "awslogs-region": "ap-southeast-2",
-            "awslogs-stream-prefix": "chat-service"
-          }
-        }
-      }
-    ]
-  }
+import (
+	"encoding/json"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type MessagePacket struct {
+	ID          string          `json:"id" bson:"id"`
+	Type        string          `json:"type" bson:"type"`
+	Action      string          `json:"action,omitempty" bson:"action,omitempty"`
+	From        string          `json:"from" bson:"from"`
+	To          string          `json:"to" bson:"to"`
+	Content     json.RawMessage `json:"content" bson:"content"`
+	Timestamp   time.Time       `json:"timestamp" bson:"timestamp"`
+	Status      string          `json:"status,omitempty" bson:"status,omitempty"`
+	DeliveredAt time.Time       `json:"delivered_at,omitempty" bson:"delivered_at,omitempty"`
+	ReadAt      time.Time       `json:"read_at,omitempty" bson:"read_at,omitempty"`
+	ClientMsgID string          `json:"client_msg_id,omitempty" bson:"client_msg_id,omitempty"`
+	SequenceNum int64           `json:"seq_num,omitempty" bson:"seq_num,omitempty"`
+}
+
+type ChatEvent struct {
+	ID        string          `json:"id" bson:"id"`
+	Type      string          `json:"type" bson:"type"`
+	UserID    string          `json:"user_id" bson:"user_id"`
+	Data      json.RawMessage `json:"data" bson:"data"`
+	Timestamp time.Time       `json:"timestamp" bson:"timestamp"`
+}
+
+type GroupMetadata struct {
+	ID          string    `json:"id" bson:"_id"`
+	Name        string    `json:"name" bson:"name"`
+	Members     []string  `json:"members" bson:"members"`
+	CreatedAt   time.Time `json:"created_at" bson:"created_at"`
+	CreatedBy   string    `json:"created_by" bson:"created_by"`
+	LastMessage time.Time `json:"last_message" bson:"last_message"`
+}
+
+type UserConnection struct {
+	UserID        string    `json:"user_id" bson:"user_id"`
+	ConnectionID  string    `json:"connection_id" bson:"connection_id"`
+	InstanceID    string    `json:"instance_id" bson:"instance_id"`
+	Connected     bool      `json:"connected" bson:"connected"`
+	LastSeen      time.Time `json:"last_seen" bson:"last_seen"`
+	LastSequence  int64     `json:"last_sequence" bson:"last_sequence"`
+	Device        string    `json:"device" bson:"device"`
+	ClientVersion string    `json:"client_version" bson:"client_version"`
+}
+
+type MessageAck struct {
+	UserID    string    `json:"user_id"`
+	MessageID string    `json:"message_id"`
+	Status    string    `json:"status"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
+func CreateNotification(action string, data map[string]interface{}) MessagePacket {
+	content, _ := json.Marshal(data)
+	return MessagePacket{
+		ID:        NewUUID(),
+		Type:      "notification",
+		Action:    action,
+		Content:   content,
+		Timestamp: time.Now(),
+		Status:    "sent",
+	}
+}
+
+func NewUUID() string {
+	return uuid.New().String()
+}
+
+
+./main.go
+package main
+
+import (
+	"context"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/gorilla/mux"
+	"github.com/joho/godotenv"
+)
+
+func main() {
+	godotenv.Load()
+
+	server, err := NewServer()
+	if err != nil {
+		log.Fatalf("Failed to create server: %v", err)
+	}
+
+	if err := server.Initialize(); err != nil {
+		log.Fatalf("Failed to initialize server: %v", err)
+	}
+
+	router := mux.NewRouter()
+	server.RegisterRoutes(router)
+
+	httpServer := &http.Server{
+		Addr:    ":" + os.Getenv("PORT"),
+		Handler: router,
+	}
+	if httpServer.Addr == ":" {
+		httpServer.Addr = ":8080"
+	}
+
+	go func() {
+		log.Printf("Starting server on %s", httpServer.Addr)
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Failed to start server: %v", err)
+		}
+	}()
+
+	if err := server.kafkaClient.StartConsumers(server); err != nil {
+		log.Fatalf("Failed to start Kafka consumers: %v", err)
+	}
+
+	go server.StartBatchProcessor()
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	<-stop
+	log.Println("Shutting down server...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := httpServer.Shutdown(ctx); err != nil {
+		log.Fatalf("Server shutdown failed: %v", err)
+	}
+
+	server.Shutdown()
+	log.Println("Server shutdown complete")
+}
+
+./kafka-client.go
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"os"
+	"sync"
+	"time"
+
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
+)
+
+const (
+	TopicMessages      = "chat.messages"
+	TopicEvents        = "chat.events"
+	TopicNotifications = "chat.notifications"
+	TopicBatchInserts  = "chat.batch.inserts"
+	ConsumerGroupID    = "chat-service-group"
+)
+
+type KafkaClient struct {
+	bootstrapServers string
+	apiKey           string
+	apiSecret        string
+	producer         *kafka.Producer
+	consumers        []*kafka.Consumer
+	ctx              context.Context
+	cancelFunc       context.CancelFunc
+	mu               sync.RWMutex
+}
+
+func NewKafkaClient(bootstrapServers string) (*KafkaClient, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	apiKey := os.Getenv("KAFKA_API_KEY")
+	apiSecret := os.Getenv("KAFKA_API_SECRET")
+
+	config := &kafka.ConfigMap{
+		"bootstrap.servers": bootstrapServers,
+		"security.protocol": "SASL_SSL",
+		"sasl.mechanisms":   "PLAIN",
+		"sasl.username":     apiKey,
+		"sasl.password":     apiSecret,
+		"acks":              "all",
+	}
+
+	producer, err := kafka.NewProducer(config)
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("failed to create producer: %v", err)
+	}
+
+	go func() {
+		for e := range producer.Events() {
+			switch ev := e.(type) {
+			case *kafka.Message:
+				if ev.TopicPartition.Error != nil {
+					log.Printf("Delivery failed: %v", ev.TopicPartition.Error)
+				}
+			case kafka.Error:
+				log.Printf("Producer error: %v", ev)
+			}
+		}
+	}()
+
+	client := &KafkaClient{
+		bootstrapServers: bootstrapServers,
+		apiKey:           apiKey,
+		apiSecret:        apiSecret,
+		producer:         producer,
+		ctx:              ctx,
+		cancelFunc:       cancel,
+	}
+
+	if err := client.checkKafkaConnection(); err != nil {
+		client.Close()
+		return nil, fmt.Errorf("failed to connect to Kafka: %v", err)
+	}
+
+	log.Println("Successfully connected to Kafka")
+	return client, nil
+}
+
+func (k *KafkaClient) checkKafkaConnection() error {
+	admin, err := kafka.NewAdminClientFromProducer(k.producer)
+	if err != nil {
+		return fmt.Errorf("failed to create admin client: %v", err)
+	}
+	defer admin.Close()
+
+	metadata, err := admin.GetMetadata(nil, true, 5000)
+	if err != nil {
+		return fmt.Errorf("failed to get metadata: %v", err)
+	}
+	log.Printf("Connected to Kafka, broker count: %d", len(metadata.Brokers))
+	return nil
+}
+
+func (k *KafkaClient) PublishMessage(msg MessagePacket) error {
+	value, err := json.Marshal(msg)
+	if err != nil {
+		return fmt.Errorf("failed to marshal message: %v", err)
+	}
+	topic := TopicMessages
+	return k.producer.Produce(&kafka.Message{
+		TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: kafka.PartitionAny},
+		Key:            []byte(msg.ID),
+		Value:          value,
+		Headers:        []kafka.Header{{Key: "message_type", Value: []byte(msg.Type)}},
+	}, nil)
+}
+
+func (k *KafkaClient) PublishEvent(event ChatEvent) error {
+	value, err := json.Marshal(event)
+	if err != nil {
+		return fmt.Errorf("failed to marshal event: %v", err)
+	}
+	topic := TopicEvents
+	return k.producer.Produce(&kafka.Message{
+		TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: kafka.PartitionAny},
+		Key:            []byte(event.ID),
+		Value:          value,
+		Headers:        []kafka.Header{{Key: "event_type", Value: []byte(event.Type)}},
+	}, nil)
+}
+
+func (k *KafkaClient) CreateConsumerGroup(topics []string, groupIDPrefix string) error {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+
+	if groupIDPrefix == "" {
+		groupIDPrefix = ConsumerGroupID
+	}
+	instanceID := os.Getenv("SERVICE_INSTANCE_ID")
+	if instanceID == "" {
+		instanceID = NewUUID()
+	}
+	groupID := fmt.Sprintf("%s-%s", groupIDPrefix, instanceID)
+
+	config := &kafka.ConfigMap{
+		"bootstrap.servers":  k.bootstrapServers,
+		"security.protocol":  "SASL_SSL",
+		"sasl.mechanisms":    "PLAIN",
+		"sasl.username":      k.apiKey,
+		"sasl.password":      k.apiSecret,
+		"group.id":           groupID,
+		"auto.offset.reset":  "earliest",
+		"enable.auto.commit": "true",
+	}
+
+	for _, topic := range topics {
+		consumer, err := kafka.NewConsumer(config)
+		if err != nil {
+			return fmt.Errorf("failed to create consumer for %s: %v", topic, err)
+		}
+		if err := consumer.Subscribe(topic, nil); err != nil {
+			consumer.Close()
+			return fmt.Errorf("failed to subscribe to %s: %v", topic, err)
+		}
+		k.consumers = append(k.consumers, consumer)
+		log.Printf("Created consumer for topic %s with group ID %s", topic, groupID)
+	}
+	return nil
+}
+
+func (k *KafkaClient) StartConsumers(server *Server) error {
+	if err := k.CreateConsumerGroup([]string{TopicMessages}, ""); err != nil {
+		return err
+	}
+	if err := k.CreateConsumerGroup([]string{TopicEvents}, "events-"); err != nil {
+		return err
+	}
+
+	k.mu.RLock()
+	defer k.mu.RUnlock()
+	for _, consumer := range k.consumers {
+		topics, err := consumer.Subscription()
+		if err != nil {
+			log.Printf("Error getting subscription for consumer: %v", err)
+			continue
+		}
+		if len(topics) > 0 {
+			switch topics[0] {
+			case TopicMessages:
+				go k.consumeMessages(consumer, server)
+			case TopicEvents:
+				go k.consumeEvents(consumer, server)
+			}
+		}
+	}
+	log.Println("Kafka consumers started successfully")
+	return nil
+}
+
+func (k *KafkaClient) consumeMessages(consumer *kafka.Consumer, server *Server) {
+	defer consumer.Close()
+	for {
+		select {
+		case <-k.ctx.Done():
+			log.Println("Consumer stopped due to context cancellation")
+			return
+		default:
+			msg, err := consumer.ReadMessage(1 * time.Second)
+			if err != nil {
+				if kafkaErr, ok := err.(kafka.Error); ok && kafkaErr.Code() == kafka.ErrTimedOut {
+					continue
+				}
+				log.Printf("Error reading message: %v", err)
+				time.Sleep(5 * time.Second)
+				continue
+			}
+			var msgPacket MessagePacket
+			if err := json.Unmarshal(msg.Value, &msgPacket); err != nil {
+				log.Printf("Error unmarshaling message: %v", err)
+				continue
+			}
+			switch msgPacket.Type {
+			case "direct":
+				server.routeDirectMessage(msgPacket)
+			case "group":
+				server.routeGroupMessage(msgPacket)
+			}
+		}
+	}
+}
+
+func (k *KafkaClient) consumeEvents(consumer *kafka.Consumer, server *Server) {
+	defer consumer.Close()
+	for {
+		select {
+		case <-k.ctx.Done():
+			log.Println("Event consumer stopped due to context cancellation")
+			return
+		default:
+			msg, err := consumer.ReadMessage(1 * time.Second)
+			if err != nil {
+				if kafkaErr, ok := err.(kafka.Error); ok && kafkaErr.Code() == kafka.ErrTimedOut {
+					continue
+				}
+				log.Printf("Error reading event: %v", err)
+				time.Sleep(5 * time.Second)
+				continue
+			}
+			var event ChatEvent
+			if err := json.Unmarshal(msg.Value, &event); err != nil {
+				log.Printf("Error unmarshaling event: %v", err)
+				continue
+			}
+			switch event.Type {
+			case "message_ack":
+				var ack MessageAck
+				if err := json.Unmarshal(event.Data, &ack); err != nil {
+					log.Printf("Error unmarshaling ack: %v", err)
+					continue
+				}
+				server.processAcknowledgment(ack.MessageID, ack.UserID, ack.Status)
+			case "connection":
+				server.updateUserPresenceState(event.UserID, true)
+			case "disconnection":
+				server.updateUserPresenceState(event.UserID, false)
+			case "group_created":
+				var group GroupMetadata
+				if err := json.Unmarshal(event.Data, &group); err != nil {
+					log.Printf("Error unmarshaling group data: %v", err)
+					continue
+				}
+				for _, memberID := range group.Members {
+					server.connectionsMux.RLock()
+					member, ok := server.connections[memberID]
+					server.connectionsMux.RUnlock()
+					if ok && member.IsConnected {
+						if !contains(member.Groups, group.ID) {
+							server.connectionsMux.Lock()
+							member.Groups = append(member.Groups, group.ID)
+							server.connectionsMux.Unlock()
+							if memberID != group.CreatedBy {
+								notification := CreateNotification("group_added", map[string]interface{}{
+									"group_id": group.ID,
+									"name":     group.Name,
+									"members":  group.Members,
+								})
+								notificationJSON, _ := json.Marshal(notification)
+								member.Send <- notificationJSON
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+func (k *KafkaClient) Close() error {
+	k.cancelFunc()
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if k.producer != nil {
+		k.producer.Flush(10000)
+		k.producer.Close()
+	}
+	for _, consumer := range k.consumers {
+		consumer.Close()
+	}
+	return nil
+}
+
+./client.go
+package main
+
+import (
+	"encoding/json"
+	"log"
+	"sync"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
+)
+
+type Client struct {
+	UserID             string
+	ConnectionID       string
+	Connection         *websocket.Conn
+	Server             *Server
+	Send               chan []byte
+	Groups             []string
+	LastSeen           time.Time
+	IsConnected        bool
+	DeviceInfo         string
+	ClientVersion      string
+	lastSequenceNumber int64
+	unackedMessages    map[string]MessagePacket
+	msgMutex           sync.RWMutex
+	connInfo           UserConnection
+	Token              string
+}
+
+func NewClient(userID string, conn *websocket.Conn, server *Server, token string) *Client {
+	connectionID := uuid.New().String()
+	connInfo := UserConnection{
+		UserID:       userID,
+		ConnectionID: connectionID,
+		InstanceID:   server.instanceID,
+		Connected:    true,
+		LastSeen:     time.Now(),
+		LastSequence: 0,
+	}
+	return &Client{
+		UserID:          userID,
+		ConnectionID:    connectionID,
+		Connection:      conn,
+		Server:          server,
+		Send:            make(chan []byte, 256),
+		Groups:          []string{},
+		LastSeen:        time.Now(),
+		IsConnected:     true,
+		unackedMessages: make(map[string]MessagePacket),
+		msgMutex:        sync.RWMutex{},
+		connInfo:        connInfo,
+		Token:           token,
+	}
+}
+
+func (c *Client) readPump() {
+	defer func() {
+		c.Server.unregisterClient(c)
+		c.Connection.Close()
+	}()
+
+	c.Connection.SetReadDeadline(time.Now().Add(60 * time.Second))
+	c.Connection.SetPongHandler(func(string) error {
+		c.Connection.SetReadDeadline(time.Now().Add(60 * time.Second))
+		return nil
+	})
+
+	for {
+		_, message, err := c.Connection.ReadMessage()
+		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				log.Printf("WebSocket read error: %v", err)
+			}
+			break
+		}
+
+		var packet struct {
+			Action       string          `json:"action"`
+			To           string          `json:"to"`
+			Content      json.RawMessage `json:"content"`
+			ClientMsgID  string          `json:"client_msg_id,omitempty"`
+			AckMessageID string          `json:"ack_message_id,omitempty"`
+			AckStatus    string          `json:"ack_status,omitempty"`
+		}
+		if err := json.Unmarshal(message, &packet); err != nil {
+			log.Printf("Error parsing message: %v", err)
+			continue
+		}
+
+		c.LastSeen = time.Now()
+		c.updateConnectionInfo()
+
+		switch packet.Action {
+		case "direct_message":
+			c.Server.handleClientDirectMessage(c, packet.To, packet.Content, packet.ClientMsgID)
+		case "group_message":
+			c.Server.handleClientGroupMessage(c, packet.To, packet.Content, packet.ClientMsgID)
+		case "create_group":
+			var groupData struct {
+				Name    string   `json:"name"`
+				Members []string `json:"members"`
+			}
+			if err := json.Unmarshal(packet.Content, &groupData); err != nil {
+				log.Printf("Error parsing group data: %v", err)
+				continue
+			}
+			if !contains(groupData.Members, c.UserID) {
+				groupData.Members = append([]string{c.UserID}, groupData.Members...)
+			}
+			c.Server.handleCreateGroup(c, groupData.Name, groupData.Members)
+		case "message_ack":
+			if packet.AckMessageID != "" {
+				c.Server.handleMessageAck(c, packet.AckMessageID, packet.AckStatus)
+			}
+		case "load_history":
+			var historyRequest struct {
+				ChatID  string `json:"chat_id"`
+				Before  int64  `json:"before,omitempty"`
+				Limit   int    `json:"limit,omitempty"`
+				IsGroup bool   `json:"is_group"`
+			}
+			if err := json.Unmarshal(packet.Content, &historyRequest); err != nil {
+				log.Printf("Error parsing history request: %v", err)
+				continue
+			}
+			c.Server.handleHistoryRequest(c, historyRequest.ChatID, historyRequest.Before, historyRequest.Limit, historyRequest.IsGroup)
+		case "presence":
+			c.Server.updateUserPresence(c)
+		case "typing":
+			c.Server.handleTypingIndicator(c, packet.To)
+		case "check_online_status":
+			var checkRequest struct {
+				UserID string `json:"user_id"`
+			}
+			if err := json.Unmarshal(packet.Content, &checkRequest); err != nil {
+				log.Printf("Error parsing online status check: %v", err)
+				continue
+			}
+			c.Server.handleOnlineStatusCheck(c, checkRequest.UserID)
+		}
+	}
+}
+
+func (c *Client) writePump() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer func() {
+		ticker.Stop()
+		c.Connection.Close()
+	}()
+
+	for {
+		select {
+		case message, ok := <-c.Send:
+			c.Connection.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if !ok {
+				c.Connection.WriteMessage(websocket.CloseMessage, []byte{})
+				return
+			}
+			w, err := c.Connection.NextWriter(websocket.TextMessage)
+			if err != nil {
+				return
+			}
+			w.Write(message)
+			n := len(c.Send)
+			for i := 0; i < n; i++ {
+				w.Write([]byte{'\n'})
+				w.Write(<-c.Send)
+			}
+			if err := w.Close(); err != nil {
+				return
+			}
+		case <-ticker.C:
+			c.Connection.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if err := c.Connection.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
+			c.LastSeen = time.Now()
+			c.updateConnectionInfo()
+		}
+	}
+}
+
+func (c *Client) updateConnectionInfo() {
+	c.connInfo.LastSeen = c.LastSeen
+	c.connInfo.Connected = c.IsConnected
+	c.Server.updateConnectionInfo(c.connInfo)
+}
+
+func (c *Client) addUnacknowledgedMessage(msg MessagePacket) {
+	c.msgMutex.Lock()
+	defer c.msgMutex.Unlock()
+	c.unackedMessages[msg.ID] = msg
+}
+
+func (c *Client) removeUnacknowledgedMessage(messageID string) {
+	c.msgMutex.Lock()
+	defer c.msgMutex.Unlock()
+	delete(c.unackedMessages, messageID)
+}
+
+func contains(slice []string, item string) bool {
+	for _, s := range slice {
+		if s == item {
+			return true
+		}
+	}
+	return false
+}
+
+./env
+# Kafka Configuration (Confluent Cloud)
+KAFKA_BOOTSTRAP_SERVERS=pkc-921jm.us-east-2.aws.confluent.cloud:9092
+KAFKA_API_KEY=JUHXV3WXBZE4XCJ6
+KAFKA_API_SECRET=fEdbPtUfESqBhNjIecbIphJbTNz9Y3kQlGoKe+Av3aLG0p/zMXdzuhpAkiwifWK7
+
+# Redis Configuration
+REDIS_ADDR=redis:6379
+REDIS_PASSWORD=
+
+# MongoDB Configuration
+MONGO_URI=mongodb+srv://sehej:Passw0rd942@wobitech.n7ilc.mongodb.net/wobichat-db?retryWrites=true&w=majority&appName=wobitech
+
+# .env
+REDIS_HOST=redis-16702.c124.us-central1-1.gce.redns.redis-cloupd.com
+REDIS_PORT=16702
+REDIS_USERNAME=default
+REDIS_PASSWORD=C9vQpbNP9YqVj1OeHmXTpCxlDKk4TxA0
+
+# Server Configuration
+PORT=8080
+
+ACCESS_TOKEN_SECRET=2e3f2d4a1a5d6c7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e
