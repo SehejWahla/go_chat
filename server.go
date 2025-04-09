@@ -188,76 +188,74 @@ func (s *Server) initRedisSubscriptions() error {
 // forceDisconnectClient actively terminates a specific connection ID for a user on the current instance.
 // It ensures only the targeted connection is affected.
 func (s *Server) forceDisconnectClient(userID, connectionIDToDisconnect string) {
+	// Lock the mutex to ensure thread-safe access to the connections map
 	s.connectionsMux.Lock()
+
+	// Retrieve the client from the connections map and verify it matches the target connection
 	clientToDisconnect, ok := s.connections[userID]
-
-	// CRITICAL CHECK: Only disconnect if the client exists AND the connection ID matches the target!
 	if ok && clientToDisconnect.ConnectionID == connectionIDToDisconnect {
+		// Log the start of the force disconnect process
 		log.Printf("Force disconnecting client: User %s, Conn %s", userID, connectionIDToDisconnect)
-		// Remove from map *before* closing channels/connections to prevent readPump/writePump
-		// from trying to unregister it again after we release the lock.
-		delete(s.connections, userID)
-		s.connectionsMux.Unlock() // Unlock *before* potentially blocking I/O operations
 
-		// Close the send channel first - signals writePump to exit. Check if already closed.
+		// Create and send a custom WebSocket close message with code 4001
+		closeMessage := websocket.FormatCloseMessage(4001, "Forced disconnect due to new connection")
+		err := clientToDisconnect.Connection.WriteControl(
+			websocket.CloseMessage,
+			closeMessage,
+			time.Now().Add(10*time.Second),
+		)
+		if err != nil {
+			// Log any error that occurs while sending the close message
+			log.Printf("Error sending close message to %s (%s): %v", userID, connectionIDToDisconnect, err)
+		}
+
+		// Remove the client from the connections map and unlock the mutex
+		delete(s.connections, userID)
+		s.connectionsMux.Unlock()
+
+		// Safely close the send channel with panic recovery
 		func() {
 			defer func() {
 				if r := recover(); r != nil {
 					log.Printf("Recovered from panic closing send channel for %s (%s): %v", userID, connectionIDToDisconnect, r)
 				}
 			}()
-			// Check if channel is non-nil and not already closed
-			// A simple non-blocking read check isn't foolproof for detecting closure
-			// A robust way is difficult without extra state, rely on recover for safety
-			// If Send is guaranteed non-nil by constructor:
-			// close(clientToDisconnect.Send)
-			// Safer approach if Send could be nil or closed elsewhere:
 			select {
 			case _, chanOk := <-clientToDisconnect.Send:
-				if chanOk {
-					// Channel was open and had something (unlikely), or was just closed by another goroutine
-					// Re-check or assume closed now
-				} else {
-					// Channel was already closed
+				if !chanOk {
 					log.Printf("Send channel for %s (%s) was already closed.", userID, connectionIDToDisconnect)
-					return // Already closed
+					return
 				}
 			default:
-				// Channel is open and empty, or nil. Assume open/nil and try closing.
-				// Need to be careful if nil is possible. Let's assume constructor ensures non-nil.
 				close(clientToDisconnect.Send)
 				log.Printf("Closed send channel for %s (%s)", userID, connectionIDToDisconnect)
 			}
 		}()
 
-		// Close the WebSocket connection - signals readPump to exit.
-		err := clientToDisconnect.Connection.Close()
+		// Close the WebSocket connection
+		err = clientToDisconnect.Connection.Close()
 		if err != nil {
-			// Log error, but proceed with cleanup. Might be already closed by client.
+			// Log any error that occurs while closing the connection
 			log.Printf("Error closing websocket connection for %s (%s): %v", userID, connectionIDToDisconnect, err)
 		}
 
-		// Clean up connection-specific Redis key (if it exists)
+		// Clean up the connection-specific Redis key
 		connInfoKey := fmt.Sprintf("conn:%s", connectionIDToDisconnect)
 		deletedCount, delErr := s.redisClient.Del(s.ctx, connInfoKey).Result()
 		if delErr != nil {
+			// Log a warning if Redis key deletion fails
 			log.Printf("WARN: Failed to delete Redis key %s during force disconnect: %v", connInfoKey, delErr)
 		} else if deletedCount > 0 {
+			// Log successful deletion of the Redis key
 			log.Printf("Deleted Redis key %s", connInfoKey)
 		}
 
+		// Log the completion of the force disconnect process
 		log.Printf("Forced disconnect completed for User %s, Conn %s", userID, connectionIDToDisconnect)
-
 	} else {
-		// The client wasn't found, or the connection ID didn't match.
-		s.connectionsMux.Unlock() // Unlock if no action taken
-		if ok {
-			// Found a client for the user, but the connection ID was different.
-			log.Printf("Disconnect request for User %s, Conn %s ignored: Found different Conn %s locally.", userID, connectionIDToDisconnect, clientToDisconnect.ConnectionID)
-		} else {
-			// User wasn't even in the local map.
-			log.Printf("Disconnect request for User %s, Conn %s ignored: User not found locally.", userID, connectionIDToDisconnect)
-		}
+		// Unlock the mutex and log if the client isn't found or doesn't match
+		s.connectionsMux.Unlock()
+		log.Printf("Disconnect request for User %s, Conn %s ignored: User not found locally or different connection.", userID, connectionIDToDisconnect)
 	}
 }
 
