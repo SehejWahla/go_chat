@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
+	"log"
 	"time"
 
 	"github.com/google/uuid"
@@ -57,15 +59,53 @@ type MessageAck struct {
 	Timestamp time.Time `json:"timestamp"`
 }
 
-func CreateNotification(action string, data map[string]interface{}) MessagePacket {
-	content, _ := json.Marshal(data)
+// Payload for 'message_ack' notification content
+type MessageAckPayload struct {
+	MessageID string `json:"message_id"` // ID of the message being acknowledged
+	UserID    string `json:"user_id"`    // User who triggered the ack (the recipient)
+	Status    string `json:"status"`     // The new status ("delivered", "read")
+	ChatID    string `json:"chat_id"`    // **ADDED**: The original 'to' field (recipient/group ID) of the acknowledged message
+}
+
+// Payload for 'history_response' notification content
+type HistoryResponsePayload struct {
+	ChatID   string          `json:"chat_id"`  // User email or Group ID
+	Messages []MessagePacket `json:"messages"` // Array of messages (sorted newest first for the page)
+	IsGroup  bool            `json:"is_group"` // Was this history for a group?
+	HasMore  bool            `json:"has_more"` // **ADDED**: Are there more older messages available?
+}
+
+// Payload for 'groups_list' notification content (NEW)
+type GroupsListPayload struct {
+	Groups []GroupMetadata `json:"groups"` // List of groups the user is in
+}
+
+// Payload for error notification content (NEW)
+type ErrorPayload struct {
+	Message string `json:"message"`
+	Details string `json:"details,omitempty"`
+}
+
+func CreateNotification(action string, data interface{}) MessagePacket {
+	content, err := json.Marshal(data)
+	originalAction := action // Store original action in case we change it to 'error'
+	if err != nil {
+		log.Printf("ERROR marshaling notification data for action %s: %v. Data: %+v", originalAction, err, data)
+		// Create a fallback error content
+		errorPayload := ErrorPayload{
+			Message: fmt.Sprintf("Internal server error preparing '%s' notification.", originalAction),
+			Details: err.Error(),
+		}
+		content, _ = json.Marshal(errorPayload) // Marshal the error payload
+		action = "error"                        // Change action type to error
+	}
 	return MessagePacket{
 		ID:        NewUUID(),
 		Type:      "notification",
-		Action:    action,
+		Action:    action, // Use potentially updated action ('error')
 		Content:   content,
 		Timestamp: time.Now(),
-		Status:    "sent",
+		Status:    "sent", // Status might not be relevant for all notifications
 	}
 }
 

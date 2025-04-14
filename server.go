@@ -976,87 +976,116 @@ func (s *Server) storePendingMessage(message MessagePacket) {
 	}
 }
 
-func (s *Server) sendMessageAck(messageID, fromUserID, toUserID, status string) {
-	ack := MessageAck{
-		UserID:    fromUserID,
+func (s *Server) sendMessageAck(messageID, ackingUserID, originalSenderID, status string) {
+	// 1. Find original message to get chatId and original sender if not provided
+	messagesCollection := s.mongoClient.Database(s.dbName).Collection("messages")
+	var originalMessage MessagePacket
+	err := messagesCollection.FindOne(s.ctx, bson.M{"id": messageID}).Decode(&originalMessage)
+	if err != nil {
+		// Log error but don't crash; ack notification cannot be sent without message details
+		log.Printf("ERROR finding original message %s for sending ack notification: %v", messageID, err)
+		return
+	}
+
+	// Determine the Chat ID (original recipient/group) and the original Sender
+	chatId := originalMessage.To // The 'to' field holds the recipient email or group ID
+	if originalSenderID == "" {
+		originalSenderID = originalMessage.From // Get sender from the message if not passed in
+	}
+
+	// Prevent sending ack to self (shouldn't happen in normal flow)
+	if originalSenderID == ackingUserID {
+		log.Printf("INFO: Suppressed sending self-ack for message %s by user %s", messageID, ackingUserID)
+		return
+	}
+
+	// 2. Create notification payload including the crucial chatId
+	ackPayload := MessageAckPayload{
 		MessageID: messageID,
+		UserID:    ackingUserID, // Who performed the ack (e.g., received/read the message)
 		Status:    status,
-		Timestamp: time.Now(),
+		ChatID:    chatId, // **Crucial Addition**: Include the original chat context ID
 	}
-	ackJSON, _ := json.Marshal(ack)
-	s.redisClient.Set(s.ctx, fmt.Sprintf("ack:%s:%s", messageID, fromUserID), ackJSON, 24*time.Hour)
-	s.addToBatch("acks", map[string]interface{}{
-		"message_id": messageID,
-		"user_id":    fromUserID,
-		"status":     status,
-		"timestamp":  time.Now(),
-	})
+	notification := CreateNotification("message_ack", ackPayload)
+	notificationJSON, _ := json.Marshal(notification) // Error handling done within CreateNotification
 
-	if toUserID == "" {
-		collection := s.mongoClient.Database(s.dbName).Collection("messages")
-		var message MessagePacket
-		err := collection.FindOne(s.ctx, bson.M{"id": messageID}).Decode(&message)
-		if err != nil {
-			log.Printf("Error finding message for ack: %v", err)
-			return
-		}
-		toUserID = message.From
-	}
-
-	notification := CreateNotification("message_ack", map[string]interface{}{
-		"message_id": messageID,
-		"user_id":    fromUserID,
-		"status":     status,
-	})
-	notificationJSON, _ := json.Marshal(notification)
+	// 3. Route notification back to the original sender
 	s.connectionsMux.RLock()
-	sender, ok := s.connections[toUserID]
+	senderClient, senderOnline := s.connections[originalSenderID]
 	s.connectionsMux.RUnlock()
-	if ok && sender.IsConnected {
-		sender.removeUnacknowledgedMessage(messageID)
-		sender.Send <- notificationJSON
+
+	if senderOnline && senderClient.IsConnected {
+		// Sender is connected to THIS instance
+		// Remove from sender's internal tracking of unacked messages
+		senderClient.removeUnacknowledgedMessage(messageID) // Use backend ID
+
+		// Send the notification non-blockingly
+		select {
+		case senderClient.Send <- notificationJSON:
+			log.Printf("Sent '%s' ack notification for msg %s (chat %s) to local sender %s", status, messageID, chatId, originalSenderID)
+		default:
+			// Log if the sender's buffer is full, message might be dropped
+			log.Printf("WARN: Send channel full for original sender %s (Conn %s) when sending ack notification", originalSenderID, senderClient.ConnectionID)
+		}
 	} else {
-		instanceID, err := s.redisClient.Get(s.ctx, fmt.Sprintf("user:%s:instance", toUserID)).Result()
+		// Sender is not connected locally, try forwarding via Redis Pub/Sub
+		instanceID, err := s.redisClient.Get(s.ctx, fmt.Sprintf("user:%s:instance", originalSenderID)).Result()
+		// Check if found, not nil error, and not the current instance
 		if err == nil && instanceID != "" && instanceID != s.instanceID {
 			forwardCmd, _ := json.Marshal(map[string]interface{}{
 				"type":    "forward_notification",
-				"to":      toUserID,
-				"payload": string(notificationJSON),
+				"to":      originalSenderID,
+				"payload": string(notificationJSON), // Forward the notification packet
 			})
-			s.redisClient.Publish(s.ctx, fmt.Sprintf("instance:%s", instanceID), forwardCmd)
+			errPub := s.redisClient.Publish(s.ctx, fmt.Sprintf("instance:%s", instanceID), forwardCmd).Err()
+			if errPub != nil {
+				log.Printf("ERROR publishing forward_notification (ack) for sender %s to instance %s: %v", originalSenderID, instanceID, errPub)
+			} else {
+				log.Printf("Forwarded '%s' ack notification for msg %s (chat %s) via Redis to sender %s on instance %s", status, messageID, chatId, originalSenderID, instanceID)
+			}
+		} else {
+			// Sender is offline or instance is unknown/invalid
+			log.Printf("Original sender %s not found online or instance unknown for ack notification %s", originalSenderID, messageID)
+			// Consider storing pending notifications if critical, but acks are often less critical
 		}
 	}
+
 }
 
-func (s *Server) processAcknowledgment(messageID, fromUserID, status string) {
-	notification := CreateNotification("message_ack", map[string]interface{}{
-		"message_id": messageID,
-		"user_id":    fromUserID,
-		"status":     status,
-	})
-	collection := s.mongoClient.Database(s.dbName).Collection("messages")
-	var message MessagePacket
-	err := collection.FindOne(s.ctx, bson.M{"id": messageID}).Decode(&message)
-	if err != nil {
-		log.Printf("Error finding message for ack: %v", err)
+func (s *Server) processAcknowledgment(messageID, ackingUserID, status string) {
+	// 1. Validate status
+	if status != "delivered" && status != "read" {
+		log.Printf("ERROR: Invalid status '%s' received for external ack processing for message %s", status, messageID)
 		return
 	}
-	senderID := message.From
-	s.connectionsMux.RLock()
-	sender, ok := s.connections[senderID]
-	s.connectionsMux.RUnlock()
-	if ok && sender.IsConnected {
-		sender.removeUnacknowledgedMessage(messageID)
-		notificationJSON, _ := json.Marshal(notification)
-		sender.Send <- notificationJSON
-	}
+
+	// 2. Update the message status in the database
+	messagesCollection := s.mongoClient.Database(s.dbName).Collection("messages")
 	update := bson.M{"$set": bson.M{"status": status}}
+	now := time.Now()
 	if status == "delivered" {
-		update["$set"].(bson.M)["delivered_at"] = time.Now()
+		update["$set"].(bson.M)["delivered_at"] = now
 	} else if status == "read" {
-		update["$set"].(bson.M)["read_at"] = time.Now()
+		update["$set"].(bson.M)["read_at"] = now
+		update["$set"].(bson.M)["delivered_at"] = now // Assume delivery if read
 	}
-	collection.UpdateOne(s.ctx, bson.M{"id": messageID}, update)
+
+	// Find the message to update its status
+	result, updateErr := messagesCollection.UpdateOne(s.ctx, bson.M{"id": messageID}, update)
+	if updateErr != nil {
+		log.Printf("ERROR updating message %s status via external ack: %v", messageID, updateErr)
+		// Decide whether to continue sending notification despite DB error
+	} else if result.MatchedCount == 0 {
+		log.Printf("WARN: External ack received for message %s, but message not found in DB for status update.", messageID)
+		// Message might have been deleted or ID is wrong
+	} else {
+		log.Printf("Updated status for message %s to '%s' via external ack from %s (DB matched: %d, modified: %d)", messageID, status, ackingUserID, result.MatchedCount, result.ModifiedCount)
+	}
+
+	// 3. Send notification back to the original sender (using the updated sendMessageAck logic)
+	// We don't know the originalSenderID here without fetching the message,
+	// but sendMessageAck now fetches it internally. Pass empty string for sender.
+	s.sendMessageAck(messageID, ackingUserID, "", status)
 }
 
 func (s *Server) handleClientGroupMessage(client *Client, groupID string, content json.RawMessage, clientMsgID string) {
@@ -1524,49 +1553,93 @@ func mustMarshal(v interface{}) []byte {
 }
 
 func (s *Server) handleHistoryRequest(client *Client, chatID string, before int64, limit int, isGroup bool) {
-	// Construct MongoDB filter based on chat type
-	var filter bson.M
+	if limit <= 0 || limit > 100 {
+		limit = 30
+	} // Apply default/max limit
+
+	filter := bson.M{}
+	// Build filter based on type
 	if isGroup {
-		filter = bson.M{"to": chatID, "type": "group"}
+		filter["type"] = "group"
+		filter["to"] = chatID // Group ID is in the 'to' field for group messages
 	} else {
-		filter = bson.M{"$or": []bson.M{
-			{"from": client.UserID, "to": chatID, "type": "direct"},
-			{"from": chatID, "to": client.UserID, "type": "direct"},
-		}}
-	}
-	if before > 0 {
-		filter["timestamp"] = bson.M{"$lt": time.Unix(before, 0)}
+		// Direct message filter
+		filter["type"] = "direct"
+		filter["$or"] = []bson.M{
+			{"from": client.UserID, "to": chatID},
+			{"from": chatID, "to": client.UserID},
+		}
 	}
 
-	// Query MongoDB
+	// Apply 'before' timestamp filter if provided (expecting milliseconds from frontend)
+	if before > 0 {
+		// Convert milliseconds timestamp to time.Time
+		beforeTime := time.Unix(0, before*int64(time.Millisecond))
+		filter["timestamp"] = bson.M{"$lt": beforeTime}
+		log.Printf("Fetching history for %s (group: %v) before %v", chatID, isGroup, beforeTime)
+	} else {
+		log.Printf("Fetching initial history for %s (group: %v)", chatID, isGroup)
+	}
+
 	collection := s.mongoClient.Database(s.dbName).Collection("messages")
-	opts := options.Find().SetSort(bson.D{{Key: "timestamp", Value: -1}}).SetLimit(int64(limit))
+
+	// Fetch limit + 1 to check if more exist. Sort descending (newest first for the page).
+	fetchLimit := int64(limit + 1)
+	opts := options.Find().SetSort(bson.D{{Key: "timestamp", Value: -1}}).SetLimit(fetchLimit)
+
 	cursor, err := collection.Find(s.ctx, filter, opts)
 	if err != nil {
-		log.Printf("Error fetching history: %v", err)
+		log.Printf("ERROR fetching history for chat %s: %v", chatID, err)
+		// Send error notification back to the client
+		errorPayload := ErrorPayload{Message: "Failed to fetch chat history."}
+		errorNotif := CreateNotification("error", errorPayload)
+		errorJSON, _ := json.Marshal(errorNotif)
+		select {
+		case client.Send <- errorJSON:
+		default:
+		} // Non-blocking send
 		return
 	}
 	defer cursor.Close(s.ctx)
 
-	// Decode results
-	var messages []MessagePacket
-	for cursor.Next(s.ctx) {
-		var message MessagePacket
-		if err := cursor.Decode(&message); err != nil {
-			log.Printf("Error decoding message: %v", err)
-			continue
+	var messagesFound []MessagePacket
+	if err = cursor.All(s.ctx, &messagesFound); err != nil {
+		log.Printf("ERROR decoding history messages for chat %s: %v", chatID, err)
+		// Send error notification back to the client
+		errorPayload := ErrorPayload{Message: "Failed to decode chat history."}
+		errorNotif := CreateNotification("error", errorPayload)
+		errorJSON, _ := json.Marshal(errorNotif)
+		select {
+		case client.Send <- errorJSON:
+		default:
 		}
-		messages = append(messages, message)
+		return
 	}
 
-	// Send response to client
-	historyResponse := CreateNotification("history_response", map[string]interface{}{
-		"chat_id":  chatID,
-		"messages": messages,
-		"is_group": isGroup,
-	})
-	responseJSON, _ := json.Marshal(historyResponse)
-	client.Send <- responseJSON
+	// Determine if there are more older messages than requested
+	hasMore := len(messagesFound) > limit
+	messagesToSend := messagesFound
+	if hasMore {
+		// Remove the extra message used only for the 'hasMore' check
+		messagesToSend = messagesFound[:limit]
+	}
+
+	// Send response back to the *requesting* client
+	historyResponsePayload := HistoryResponsePayload{
+		ChatID:   chatID,
+		Messages: messagesToSend, // Messages are newest first within the fetched page
+		IsGroup:  isGroup,
+		HasMore:  hasMore, // Inform client if more exist
+	}
+	notification := CreateNotification("history_response", historyResponsePayload)
+	notificationJSON, _ := json.Marshal(notification)
+
+	select {
+	case client.Send <- notificationJSON:
+		log.Printf("Sent history response (%d messages, hasMore: %v) for chat %s to %s", len(messagesToSend), hasMore, chatID, client.UserID)
+	default:
+		log.Printf("WARN: Send channel full for user %s (Conn %s) when sending history response", client.UserID, client.ConnectionID)
+	}
 }
 
 func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
@@ -1576,4 +1649,102 @@ func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(version)
+}
+
+func (s *Server) handleLoadGroups(client *Client) {
+	userGroupsCollection := s.mongoClient.Database(s.dbName).Collection("user_groups")
+	groupsCollection := s.mongoClient.Database(s.dbName).Collection("groups")
+
+	log.Printf("Handling load_groups request for user %s", client.UserID)
+
+	// 1. Find the user's group memberships document
+	var userGroupsDoc struct {
+		UserID string   `bson:"user_id"`
+		Groups []string `bson:"groups"` // Assuming group IDs are stored as strings
+	}
+	err := userGroupsCollection.FindOne(s.ctx, bson.M{"user_id": client.UserID}).Decode(&userGroupsDoc)
+
+	// Handle cases where user has no groups or document doesn't exist
+	if err != nil {
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			log.Printf("User %s has no group memberships document or is not in any groups.", client.UserID)
+			// Send an empty list back
+			groupsListPayload := GroupsListPayload{Groups: []GroupMetadata{}}
+			notification := CreateNotification("groups_list", groupsListPayload)
+			notificationJSON, _ := json.Marshal(notification)
+			select {
+			case client.Send <- notificationJSON:
+			default:
+			}
+			return
+		}
+		// Handle other potential errors during fetch
+		log.Printf("ERROR finding user_groups document for %s: %v", client.UserID, err)
+		errorPayload := ErrorPayload{Message: "Failed to retrieve your group memberships."}
+		errorNotif := CreateNotification("error", errorPayload)
+		errorJSON, _ := json.Marshal(errorNotif)
+		select {
+		case client.Send <- errorJSON:
+		default:
+		}
+		return
+	}
+
+	// Check if the groups list is empty
+	if len(userGroupsDoc.Groups) == 0 {
+		log.Printf("User %s is member of 0 groups.", client.UserID)
+		groupsListPayload := GroupsListPayload{Groups: []GroupMetadata{}}
+		notification := CreateNotification("groups_list", groupsListPayload)
+		notificationJSON, _ := json.Marshal(notification)
+		select {
+		case client.Send <- notificationJSON:
+		default:
+		}
+		return
+	}
+
+	// 2. Fetch metadata for the groups the user is a member of
+	// Assuming Group IDs are stored and queried as strings in the 'groups' collection _id field
+	filter := bson.M{"_id": bson.M{"$in": userGroupsDoc.Groups}}
+	// Add projection if you only need specific fields (id, name, etc.)
+	// opts := options.Find().SetProjection(bson.M{"_id": 1, "name": 1, "last_message": 1}) // Example projection
+
+	cursor, err := groupsCollection.Find(s.ctx, filter /*, opts*/) // Add opts if using projection
+	if err != nil {
+		log.Printf("ERROR fetching group metadata for user %s (%d groups): %v", client.UserID, len(userGroupsDoc.Groups), err)
+		errorPayload := ErrorPayload{Message: "Failed to retrieve details for your groups."}
+		errorNotif := CreateNotification("error", errorPayload)
+		errorJSON, _ := json.Marshal(errorNotif)
+		select {
+		case client.Send <- errorJSON:
+		default:
+		}
+		return
+	}
+	defer cursor.Close(s.ctx)
+
+	var groups []GroupMetadata
+	if err = cursor.All(s.ctx, &groups); err != nil {
+		log.Printf("ERROR decoding group metadata for user %s: %v", client.UserID, err)
+		errorPayload := ErrorPayload{Message: "Failed to process group details."}
+		errorNotif := CreateNotification("error", errorPayload)
+		errorJSON, _ := json.Marshal(errorNotif)
+		select {
+		case client.Send <- errorJSON:
+		default:
+		}
+		return
+	}
+
+	// 3. Send the list back to the *requesting* client
+	groupsListPayload := GroupsListPayload{Groups: groups}
+	notification := CreateNotification("groups_list", groupsListPayload)
+	notificationJSON, _ := json.Marshal(notification)
+
+	select {
+	case client.Send <- notificationJSON:
+		log.Printf("Sent groups list (%d groups) to user %s", len(groups), client.UserID)
+	default:
+		log.Printf("WARN: Send channel full for user %s (Conn %s) when sending groups list", client.UserID, client.ConnectionID)
+	}
 }
