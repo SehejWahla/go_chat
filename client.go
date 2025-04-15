@@ -148,41 +148,59 @@ func (c *Client) readPump() {
 	}
 }
 
+// client.go
+
 func (c *Client) writePump() {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(pingPeriod) // Use pingPeriod constant
 	defer func() {
 		ticker.Stop()
 		c.Connection.Close()
+		log.Printf("Closed writePump for client %s (%s)", c.UserID, c.ConnectionID)
 	}()
 
 	for {
 		select {
 		case message, ok := <-c.Send:
-			c.Connection.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			// Set deadline for writing the message
+			_ = c.Connection.SetWriteDeadline(time.Now().Add(writeWait))
 			if !ok {
-				c.Connection.WriteMessage(websocket.CloseMessage, []byte{})
-				return
+				// The Send channel was closed. Send a close message.
+				log.Printf("Send channel closed for %s (%s). Sending close message.", c.UserID, c.ConnectionID)
+				// Don't wait indefinitely if write fails
+				_ = c.Connection.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+				return // Exit loop
 			}
-			w, err := c.Connection.NextWriter(websocket.TextMessage)
+
+			// --- FIX: Send only ONE message per iteration ---
+			err := c.Connection.WriteMessage(websocket.TextMessage, message)
 			if err != nil {
-				return
+				log.Printf("Error writing message to %s (%s): %v", c.UserID, c.ConnectionID, err)
+				return // Exit loop on write error
 			}
-			w.Write(message)
-			n := len(c.Send)
-			for i := 0; i < n; i++ {
-				w.Write([]byte{'\n'})
-				w.Write(<-c.Send)
-			}
-			if err := w.Close(); err != nil {
-				return
-			}
+			// --- REMOVED inner loop that drains c.Send ---
+			/*
+			   n := len(c.Send) // Don't drain channel here
+			   for i := 0; i < n; i++ {
+			       // This logic causes multiple JSON objects in one frame
+			       w.Write([]byte{'\n'}) // Don't add separators
+			       w.Write(<-c.Send)
+			   }
+			   if err := w.Close(); err != nil { // w.Close() was for NextWriter
+			       return
+			   }
+			*/
+
 		case <-ticker.C:
-			c.Connection.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			// Send ping message
+			_ = c.Connection.SetWriteDeadline(time.Now().Add(writeWait))
 			if err := c.Connection.WriteMessage(websocket.PingMessage, nil); err != nil {
-				return
+				log.Printf("Error writing ping to %s (%s): %v", c.UserID, c.ConnectionID, err)
+				return // Exit loop on ping error
 			}
-			c.LastSeen = time.Now()
-			c.updateConnectionInfo()
+			// log.Printf("Ping sent to %s", c.UserID) // Debug log
+			// Update connection info periodically (optional, maybe less frequent)
+			// c.LastSeen = time.Now() // LastSeen updated by PongHandler or message activity
+			// c.updateConnectionInfo()
 		}
 	}
 }

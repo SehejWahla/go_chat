@@ -1,3 +1,5 @@
+// server.go
+
 package main
 
 import (
@@ -33,6 +35,13 @@ func extractDatabaseFromURI(uri string) string {
 	}
 	return uri[:questionMark]
 }
+
+type AckInfo struct {
+	Sender string `json:"sender"`
+	ChatID string `json:"chatID"`
+}
+
+const ackInfoTTL = 5 * time.Minute
 
 type Server struct {
 	instanceID        string
@@ -273,21 +282,22 @@ func (s *Server) handleRedisMessages() {
 			return
 		case msg := <-ch:
 			if msg == nil {
-				// This case typically occurs if the PubSub connection is closed externally or encounters a severe error.
 				log.Println("Redis PubSub channel returned nil message. Attempting to re-subscribe...")
-				// Optional: Add logic to attempt re-subscription with backoff
 				time.Sleep(5 * time.Second) // Prevent tight loop on persistent error
-				// Re-initialize subscription
 				err := s.initRedisSubscriptions()
 				if err != nil {
 					log.Printf("FATAL: Failed to re-subscribe to Redis after channel closure: %v", err)
-					// Consider shutting down the server instance if Redis is critical and cannot reconnect
-					s.Shutdown() // Or trigger a more graceful shutdown sequence
+					s.Shutdown()
 				} else {
 					log.Println("Successfully re-subscribed to Redis.")
-					// Important: The old goroutine exits here, a new one is started by initRedisSubscriptions
-					return
 				}
+				// The previous goroutine implicitly exits when the channel closes or returns nil.
+				// A new one is started by initRedisSubscriptions if successful.
+				// If re-subscribe fails and Shutdown is called, the context cancellation will stop this loop eventually.
+				// If re-subscribe succeeds, this goroutine *should* exit because the channel `ch` it's reading from
+				// is associated with the *closed* PubSub object. The new goroutine reads from the new channel.
+				// Adding an explicit return here after re-subscribe attempt might be safer.
+				return // Exit this goroutine after attempting re-subscribe.
 			}
 
 			// Handle instance-specific messages (forwarding, disconnects)
@@ -322,16 +332,16 @@ func (s *Server) handleRedisMessages() {
 					recipient, ok := s.connections[recipientID]
 					s.connectionsMux.RUnlock()
 					if ok && recipient.IsConnected {
-						// Use non-blocking send to prevent deadlock if client channel is full
 						select {
 						case recipient.Send <- []byte(payload):
-							s.sendMessageAck(msgPacket.ID, recipientID, msgPacket.From, "delivered")
+							// *** FIX: Call new signature with originalChatID (msgPacket.To) ***
+							s.sendMessageAck(msgPacket.ID, recipientID, msgPacket.From, msgPacket.To, "delivered")
 						default:
 							log.Printf("WARN: Send channel full for user %s (Conn %s), dropping forwarded message %s", recipientID, recipient.ConnectionID, msgPacket.ID)
-							// Consider alternative handling for full buffers (e.g., requeueing, notifying sender)
 						}
 					} else {
-						log.Printf("User %s not found locally for forwarded message %s, might be offline or disconnected", recipientID, msgPacket.ID)
+						// User might have disconnected between routing decision and message arrival here
+						// log.Printf("User %s not found locally for forwarded message %s", recipientID, msgPacket.ID)
 					}
 
 				case "forward_group_message":
@@ -348,9 +358,7 @@ func (s *Server) handleRedisMessages() {
 						for _, m := range membersInterface {
 							if memberStr, okStr := m.(string); okStr {
 								members = append(members, memberStr)
-							} else {
-								log.Printf("WARN: Non-string member found in forward_group_message members list: %v", m)
-							}
+							} // Silently skip non-strings
 						}
 					} else {
 						log.Printf("Error: invalid members type (%T) in forward_group_message for group %s", membersPayload, groupID)
@@ -358,8 +366,9 @@ func (s *Server) handleRedisMessages() {
 					}
 
 					if len(members) == 0 {
-						log.Printf("WARN: Received forward_group_message for group %s with empty resolved members list.", groupID)
-						continue // No one on this instance to send to
+						// This is expected if no members of the group are on this instance
+						// log.Printf("WARN: Received forward_group_message for group %s with empty resolved members list.", groupID)
+						continue
 					}
 
 					var msgPacket MessagePacket
@@ -371,18 +380,18 @@ func (s *Server) handleRedisMessages() {
 					for _, memberID := range members {
 						s.connectionsMux.RLock()
 						recipient, ok := s.connections[memberID]
-						s.connectionsMux.RUnlock() // Unlock inside loop after check
+						s.connectionsMux.RUnlock()
 						if ok && recipient.IsConnected {
-							// Use non-blocking send
 							select {
 							case recipient.Send <- []byte(payload):
-								s.sendMessageAck(msgPacket.ID, memberID, msgPacket.From, "delivered")
+								// *** FIX: Call new signature with originalChatID (groupID) ***
+								s.sendMessageAck(msgPacket.ID, memberID, msgPacket.From, groupID, "delivered")
 							default:
 								log.Printf("WARN: Send channel full for user %s (Conn %s), dropping forwarded group message %s", memberID, recipient.ConnectionID, msgPacket.ID)
 							}
 						} else {
-							// This is expected if the member disconnected just after the routing decision was made
-							log.Printf("User %s not found locally for forwarded group message %s", memberID, msgPacket.ID)
+							// User might have disconnected
+							// log.Printf("User %s not found locally for forwarded group message %s", memberID, msgPacket.ID)
 						}
 					}
 
@@ -393,19 +402,16 @@ func (s *Server) handleRedisMessages() {
 						log.Printf("Invalid 'forward_notification' format: %+v", message)
 						continue
 					}
-
 					s.connectionsMux.RLock()
 					client, ok := s.connections[toUserID]
 					s.connectionsMux.RUnlock()
 					if ok && client.IsConnected {
 						select {
 						case client.Send <- []byte(payload):
-							// Notification sent
 						default:
 							log.Printf("WARN: Send channel full for user %s (Conn %s), dropping forwarded notification", toUserID, client.ConnectionID)
 						}
-					} else {
-						log.Printf("User %s not found locally for forwarded notification", toUserID)
+					} else { /* User not local */
 					}
 
 				case "disconnect_user":
@@ -421,8 +427,6 @@ func (s *Server) handleRedisMessages() {
 				case "forward_typing":
 					toUserID, okTo := message["to"].(string)
 					payload, okPayload := message["payload"].(string)
-					// fromUserID might also be useful for context, though not strictly needed to forward
-					// fromUserID, _ := message["from"].(string)
 					if !okTo || !okPayload {
 						log.Printf("Invalid 'forward_typing' format: %+v", message)
 						continue
@@ -433,9 +437,8 @@ func (s *Server) handleRedisMessages() {
 					if ok && recipient.IsConnected {
 						select {
 						case recipient.Send <- []byte(payload):
-							// Typing indicator sent
 						default:
-							log.Printf("WARN: Send channel full for user %s (Conn %s), dropping forwarded typing indicator", toUserID, recipient.ConnectionID)
+							log.Printf("WARN: Send channel full for user %s, dropping typing indicator", toUserID)
 						}
 					}
 
@@ -443,12 +446,10 @@ func (s *Server) handleRedisMessages() {
 					groupID, okGroup := message["group_id"].(string)
 					payload, okPayload := message["payload"].(string)
 					membersPayload, okMembers := message["members"]
-					// fromUserID, _ := message["from"].(string) // Optional context
 					if !okGroup || !okPayload || !okMembers {
 						log.Printf("Invalid 'forward_group_typing' format: %+v", message)
 						continue
 					}
-
 					var members []string
 					if membersInterface, ok := membersPayload.([]interface{}); ok {
 						for _, m := range membersInterface {
@@ -457,14 +458,12 @@ func (s *Server) handleRedisMessages() {
 							}
 						}
 					} else {
-						log.Printf("Error: invalid members type (%T) in forward_group_typing for group %s", membersPayload, groupID)
+						log.Printf("Error: invalid members type (%T) for group %s", membersPayload, groupID)
 						continue
 					}
-
 					if len(members) == 0 {
 						continue
 					}
-
 					for _, memberID := range members {
 						s.connectionsMux.RLock()
 						recipient, ok := s.connections[memberID]
@@ -472,9 +471,8 @@ func (s *Server) handleRedisMessages() {
 						if ok && recipient.IsConnected {
 							select {
 							case recipient.Send <- []byte(payload):
-								// Group typing indicator sent
 							default:
-								log.Printf("WARN: Send channel full for user %s (Conn %s), dropping forwarded group typing indicator", memberID, recipient.ConnectionID)
+								log.Printf("WARN: Send channel full for user %s, dropping group typing indicator", memberID)
 							}
 						}
 					}
@@ -485,17 +483,9 @@ func (s *Server) handleRedisMessages() {
 				} // end switch messageType
 
 			} else if msg.Channel == "global:notifications" {
-				// Handle global notifications if necessary
 				log.Printf("Received global notification: %s", msg.Payload)
 				// Example: Propagate to all clients on this instance if needed
-				// s.connectionsMux.RLock()
-				// for _, client := range s.connections {
-				//  select {
-				//  case client.Send <- []byte(msg.Payload):
-				//  default: log.Printf("WARN: Send channel full for user %s during global notification broadcast", client.UserID)
-				//  }
-				// }
-				// s.connectionsMux.RUnlock()
+				// s.broadcastToLocalClients([]byte(msg.Payload))
 
 			} else {
 				log.Printf("Received message on unexpected Redis channel: %s", msg.Channel)
@@ -579,27 +569,44 @@ func (s *Server) deliverPendingMessages(client *Client) {
 	filter := bson.M{"to": client.UserID}
 	cursor, err := collection.Find(s.ctx, filter, options.Find().SetSort(bson.D{{Key: "timestamp", Value: 1}}))
 	if err != nil {
-		log.Printf("Error fetching pending messages: %v", err)
+		log.Printf("Error fetching pending: %v", err)
 		return
 	}
 	defer cursor.Close(s.ctx)
-
 	var deliveredMsgIDs []string
 	for cursor.Next(s.ctx) {
 		var message MessagePacket
 		if err := cursor.Decode(&message); err != nil {
-			log.Printf("Error decoding pending message: %v", err)
+			log.Printf("Error decoding pending: %v", err)
 			continue
 		}
+		// Mark as delivered when sending from pending queue
 		message.Status = "delivered"
 		message.DeliveredAt = time.Now()
 		messageJSON, _ := json.Marshal(message)
-		client.Send <- messageJSON
-		deliveredMsgIDs = append(deliveredMsgIDs, message.ID)
-		s.sendMessageAck(message.ID, client.UserID, message.From, "delivered")
+		delivered := false
+		select {
+		case client.Send <- messageJSON:
+			delivered = true
+		default:
+			log.Printf("WARN: Send channel full for user %s while delivering pending message %s", client.UserID, message.ID)
+			// Optionally break or implement retry/requeue logic for pending messages if buffer is full
+		}
+
+		// Only ack and delete if successfully sent to client buffer
+		if delivered {
+			deliveredMsgIDs = append(deliveredMsgIDs, message.ID)
+			// Call NEW signature: messageID, ackingUser, originalSender, originalChatID (recipient), status
+			s.sendMessageAck(message.ID, client.UserID, message.From, message.To, "delivered")
+		}
 	}
 	if len(deliveredMsgIDs) > 0 {
-		collection.DeleteMany(s.ctx, bson.M{"id": bson.M{"$in": deliveredMsgIDs}})
+		_, err := collection.DeleteMany(s.ctx, bson.M{"id": bson.M{"$in": deliveredMsgIDs}})
+		if err != nil {
+			log.Printf("Error deleting delivered pending messages: %v", err)
+		} else {
+			log.Printf("Deleted %d pending messages for user %s", len(deliveredMsgIDs), client.UserID)
+		}
 	}
 }
 
@@ -923,47 +930,92 @@ func (s *Server) loadUserGroups(client *Client) {
 func (s *Server) handleClientDirectMessage(client *Client, toUserID string, content json.RawMessage, clientMsgID string) {
 	chatID := getDirectChatID(client.UserID, toUserID)
 	seqNum := s.getNextSequenceNumber(chatID)
-	message := MessagePacket{
-		ID:          NewUUID(),
-		Type:        "direct",
-		From:        client.UserID,
-		To:          toUserID,
-		Content:     content,
-		Timestamp:   time.Now(),
-		Status:      "sent",
-		ClientMsgID: clientMsgID,
-		SequenceNum: seqNum,
-	}
+	message := MessagePacket{ID: NewUUID(), Type: "direct", From: client.UserID, To: toUserID, Content: content, Timestamp: time.Now(), Status: "sent", ClientMsgID: clientMsgID, SequenceNum: seqNum}
 	messageJSON, _ := json.Marshal(message)
-	client.Send <- messageJSON
-	client.addUnacknowledgedMessage(message)
+	// Send back to sender *immediately* with 'sent' status (non-blocking)
+	select {
+	case client.Send <- messageJSON:
+		client.addUnacknowledgedMessage(message) // Track only if successfully sent to own buffer
+	default:
+		log.Printf("WARN: Send channel full for sender %s, dropping self-sent message %s", client.UserID, message.ID)
+		// Consider if an error should be sent back to the client here
+	}
+	// Route to recipient and add to DB batch
 	s.routeDirectMessage(message)
 	s.updateUserSequenceNumber(client.UserID, seqNum)
 }
 
 func (s *Server) routeDirectMessage(message MessagePacket) {
 	recipientID := message.To
+	// Send copy with original 'sent' status
+	// The recipient's client will send back 'delivered'/'read' acks
+	recipientCopy := message
+
+	// *** Store Ack Info in Redis before batching/routing ***
+	ackInfo := AckInfo{Sender: message.From, ChatID: message.To}
+	ackInfoJSON, errMarshal := json.Marshal(ackInfo)
+	if errMarshal == nil {
+		redisKey := fmt.Sprintf("ackinfo:%s", message.ID)
+		// Use SetEX for automatic expiration
+		errSet := s.redisClient.SetEX(s.ctx, redisKey, string(ackInfoJSON), ackInfoTTL).Err()
+		if errSet != nil {
+			log.Printf("WARN: Failed to set temporary ack info in Redis for msg %s: %v", message.ID, errSet)
+			// Continue routing even if Redis fails, ack notification might be delayed if lookup fails later
+		}
+	} else {
+		log.Printf("ERROR: Failed to marshal AckInfo for msg %s: %v", message.ID, errMarshal)
+		// Continue routing, ack notification might be delayed
+	}
+	// *** End Store Ack Info ***
+
+	// Check if recipient is connected locally
 	s.connectionsMux.RLock()
 	recipient, ok := s.connections[recipientID]
 	s.connectionsMux.RUnlock()
+
 	if ok && recipient.IsConnected {
-		messageJSON, _ := json.Marshal(message)
-		recipient.Send <- messageJSON
-		s.sendMessageAck(message.ID, recipientID, message.From, "delivered")
+		// Recipient is local
+		messageJSON, _ := json.Marshal(recipientCopy) // Marshal the 'sent' copy
+		select {
+		case recipient.Send <- messageJSON:
+			log.Printf("Routed direct message %s to local recipient %s", message.ID, recipientID)
+			// Server no longer sends immediate 'delivered' ack here.
+			// Recipient client is now responsible for sending 'delivered' ack.
+		default:
+			log.Printf("WARN: Send channel full for recipient %s, dropping message %s", recipientID, message.ID)
+			// If send fails even locally, store as pending
+			s.storePendingMessage(message)
+		}
 	} else {
+		// Recipient not local, check Redis for their instance
 		instanceID, err := s.redisClient.Get(s.ctx, fmt.Sprintf("user:%s:instance", recipientID)).Result()
 		if err == nil && instanceID != "" && instanceID != s.instanceID {
-			messageJSON, _ := json.Marshal(message)
+			// Recipient is on another known instance, forward via Redis Pub/Sub
+			messageJSON, _ := json.Marshal(recipientCopy) // Marshal the 'sent' copy
 			forwardCmd, _ := json.Marshal(map[string]interface{}{
 				"type":    "forward_message",
 				"to":      recipientID,
 				"payload": string(messageJSON),
 			})
-			s.redisClient.Publish(s.ctx, fmt.Sprintf("instance:%s", instanceID), forwardCmd)
+			errPub := s.redisClient.Publish(s.ctx, fmt.Sprintf("instance:%s", instanceID), forwardCmd).Err()
+			if errPub != nil {
+				log.Printf("ERROR publishing forward_message for %s to instance %s: %v", recipientID, instanceID, errPub)
+				// Store original message as pending if forwarding fails
+				s.storePendingMessage(message)
+			} else {
+				log.Printf("Forwarded direct message %s via Redis to recipient %s on instance %s", message.ID, recipientID, instanceID)
+			}
 		} else {
+			// Handle Redis error or user truly offline/instance unknown
+			if err != nil && !errors.Is(err, redis.Nil) {
+				log.Printf("ERROR checking Redis instance for recipient %s: %v", recipientID, err)
+			}
+			// Store the original 'sent' version as pending if offline or instance lookup fails
 			s.storePendingMessage(message)
 		}
 	}
+
+	// Add original 'sent' message to batch for DB insertion AFTER routing attempt and storing temp ack info
 	s.addToBatch("messages", message)
 }
 
@@ -976,116 +1028,160 @@ func (s *Server) storePendingMessage(message MessagePacket) {
 	}
 }
 
-func (s *Server) sendMessageAck(messageID, ackingUserID, originalSenderID, status string) {
-	// 1. Find original message to get chatId and original sender if not provided
-	messagesCollection := s.mongoClient.Database(s.dbName).Collection("messages")
-	var originalMessage MessagePacket
-	err := messagesCollection.FindOne(s.ctx, bson.M{"id": messageID}).Decode(&originalMessage)
-	if err != nil {
-		// Log error but don't crash; ack notification cannot be sent without message details
-		log.Printf("ERROR finding original message %s for sending ack notification: %v", messageID, err)
-		return
-	}
-
-	// Determine the Chat ID (original recipient/group) and the original Sender
-	chatId := originalMessage.To // The 'to' field holds the recipient email or group ID
-	if originalSenderID == "" {
-		originalSenderID = originalMessage.From // Get sender from the message if not passed in
-	}
-
-	// Prevent sending ack to self (shouldn't happen in normal flow)
+// *** MODIFIED sendMessageAck Signature and Logic ***
+func (s *Server) sendMessageAck(messageID, ackingUserID, originalSenderID, originalChatID, status string) {
+	// Prevent sending ack to self
 	if originalSenderID == ackingUserID {
-		log.Printf("INFO: Suppressed sending self-ack for message %s by user %s", messageID, ackingUserID)
+		// log.Printf("INFO: Suppressed sending self-ack for message %s by user %s", messageID, ackingUserID)
+		return
+	}
+	// If original sender is empty (can happen from processAcknowledgment if DB lookup failed), log warning and stop.
+	if originalSenderID == "" {
+		log.Printf("WARN: sendMessageAck called with empty originalSenderID for message %s, cannot send notification.", messageID)
+		return
+	}
+	if originalChatID == "" {
+		log.Printf("WARN: sendMessageAck called with empty originalChatID for message %s, cannot send notification.", messageID)
 		return
 	}
 
-	// 2. Create notification payload including the crucial chatId
+	// Create notification payload (DB lookup removed)
 	ackPayload := MessageAckPayload{
 		MessageID: messageID,
-		UserID:    ackingUserID, // Who performed the ack (e.g., received/read the message)
+		UserID:    ackingUserID, // Who performed the ack
 		Status:    status,
-		ChatID:    chatId, // **Crucial Addition**: Include the original chat context ID
+		ChatID:    originalChatID, // Use passed-in chat ID
 	}
 	notification := CreateNotification("message_ack", ackPayload)
-	notificationJSON, _ := json.Marshal(notification) // Error handling done within CreateNotification
+	notificationJSON, _ := json.Marshal(notification) // Error handled in CreateNotification
 
-	// 3. Route notification back to the original sender
+	// Route notification back to the original sender
 	s.connectionsMux.RLock()
 	senderClient, senderOnline := s.connections[originalSenderID]
 	s.connectionsMux.RUnlock()
 
 	if senderOnline && senderClient.IsConnected {
-		// Sender is connected to THIS instance
-		// Remove from sender's internal tracking of unacked messages
-		senderClient.removeUnacknowledgedMessage(messageID) // Use backend ID
-
-		// Send the notification non-blockingly
+		// Sender connected locally
+		senderClient.removeUnacknowledgedMessage(messageID) // Remove from internal tracking
 		select {
 		case senderClient.Send <- notificationJSON:
-			log.Printf("Sent '%s' ack notification for msg %s (chat %s) to local sender %s", status, messageID, chatId, originalSenderID)
+			// log.Printf("Sent '%s' ack notification for msg %s (chat %s) to local sender %s", status, messageID, originalChatID, originalSenderID)
 		default:
-			// Log if the sender's buffer is full, message might be dropped
-			log.Printf("WARN: Send channel full for original sender %s (Conn %s) when sending ack notification", originalSenderID, senderClient.ConnectionID)
+			log.Printf("WARN: Send channel full for sender %s (Conn %s) for ack notification", originalSenderID, senderClient.ConnectionID)
 		}
 	} else {
-		// Sender is not connected locally, try forwarding via Redis Pub/Sub
+		// Sender not local, forward via Redis
 		instanceID, err := s.redisClient.Get(s.ctx, fmt.Sprintf("user:%s:instance", originalSenderID)).Result()
-		// Check if found, not nil error, and not the current instance
 		if err == nil && instanceID != "" && instanceID != s.instanceID {
 			forwardCmd, _ := json.Marshal(map[string]interface{}{
 				"type":    "forward_notification",
 				"to":      originalSenderID,
-				"payload": string(notificationJSON), // Forward the notification packet
+				"payload": string(notificationJSON),
 			})
 			errPub := s.redisClient.Publish(s.ctx, fmt.Sprintf("instance:%s", instanceID), forwardCmd).Err()
 			if errPub != nil {
-				log.Printf("ERROR publishing forward_notification (ack) for sender %s to instance %s: %v", originalSenderID, instanceID, errPub)
-			} else {
-				log.Printf("Forwarded '%s' ack notification for msg %s (chat %s) via Redis to sender %s on instance %s", status, messageID, chatId, originalSenderID, instanceID)
+				log.Printf("ERROR publishing forward_notification (ack) sender %s instance %s: %v", originalSenderID, instanceID, errPub)
 			}
+			// else { log.Printf("Forwarded '%s' ack notification msg %s (chat %s) via Redis sender %s instance %s", status, messageID, originalChatID, originalSenderID, instanceID) }
 		} else {
-			// Sender is offline or instance is unknown/invalid
-			log.Printf("Original sender %s not found online or instance unknown for ack notification %s", originalSenderID, messageID)
-			// Consider storing pending notifications if critical, but acks are often less critical
+			// Log error if Redis lookup failed (excluding redis.Nil)
+			if err != nil && !errors.Is(err, redis.Nil) {
+				log.Printf("ERROR looking up instance for sender %s during ack forward: %v", originalSenderID, err)
+			} else {
+				log.Printf("Sender %s offline/instance unknown for ack notification %s", originalSenderID, messageID)
+			}
+			// Consider storing pending notifications if needed, but acks might be lower priority
 		}
 	}
-
 }
 
 func (s *Server) processAcknowledgment(messageID, ackingUserID, status string) {
-	// 1. Validate status
 	if status != "delivered" && status != "read" {
-		log.Printf("ERROR: Invalid status '%s' received for external ack processing for message %s", status, messageID)
+		log.Printf("ERROR: Invalid status '%s' from external ack msg %s", status, messageID)
 		return
 	}
 
-	// 2. Update the message status in the database
 	messagesCollection := s.mongoClient.Database(s.dbName).Collection("messages")
-	update := bson.M{"$set": bson.M{"status": status}}
-	now := time.Now()
-	if status == "delivered" {
-		update["$set"].(bson.M)["delivered_at"] = now
-	} else if status == "read" {
-		update["$set"].(bson.M)["read_at"] = now
-		update["$set"].(bson.M)["delivered_at"] = now // Assume delivery if read
-	}
+	var originalMessage MessagePacket
+	var ackInfoFromRedis AckInfo
+	var foundInDB = false
+	var fetchedSender = ""
+	var fetchedChatID = ""
 
-	// Find the message to update its status
-	result, updateErr := messagesCollection.UpdateOne(s.ctx, bson.M{"id": messageID}, update)
-	if updateErr != nil {
-		log.Printf("ERROR updating message %s status via external ack: %v", messageID, updateErr)
-		// Decide whether to continue sending notification despite DB error
-	} else if result.MatchedCount == 0 {
-		log.Printf("WARN: External ack received for message %s, but message not found in DB for status update.", messageID)
-		// Message might have been deleted or ID is wrong
+	// 1. Attempt to find message in DB
+	findErr := messagesCollection.FindOne(s.ctx, bson.M{"id": messageID}).Decode(&originalMessage)
+
+	if findErr == nil {
+		foundInDB = true
+		fetchedSender = originalMessage.From
+		fetchedChatID = originalMessage.To
+		log.Printf("Found message %s in DB for ack processing.", messageID)
+	} else if errors.Is(findErr, mongo.ErrNoDocuments) {
+		log.Printf("WARN: External ack received for message %s, but message not found in DB yet. Attempting Redis lookup.", messageID)
+		// Attempt Redis lookup if not found in DB
+		redisKey := fmt.Sprintf("ackinfo:%s", messageID)
+		ackInfoJSON, redisErr := s.redisClient.Get(s.ctx, redisKey).Result()
+		if redisErr == nil {
+			if errUnmarshal := json.Unmarshal([]byte(ackInfoJSON), &ackInfoFromRedis); errUnmarshal == nil {
+				fetchedSender = ackInfoFromRedis.Sender
+				fetchedChatID = ackInfoFromRedis.ChatID
+				log.Printf("Found ack info for message %s in Redis.", messageID)
+			} else {
+				log.Printf("ERROR unmarshaling ack info from Redis for msg %s: %v", messageID, errUnmarshal)
+			}
+		} else if !errors.Is(redisErr, redis.Nil) {
+			log.Printf("ERROR looking up ack info in Redis for msg %s: %v", messageID, redisErr)
+		} else {
+			log.Printf("WARN: Ack info for message %s not found in Redis either (likely expired or never set).", messageID)
+		}
 	} else {
-		log.Printf("Updated status for message %s to '%s' via external ack from %s (DB matched: %d, modified: %d)", messageID, status, ackingUserID, result.MatchedCount, result.ModifiedCount)
+		// Other DB error finding message
+		log.Printf("ERROR finding original message %s for external ack processing: %v", messageID, findErr)
 	}
 
-	// 3. Send notification back to the original sender (using the updated sendMessageAck logic)
-	// We don't know the originalSenderID here without fetching the message,
-	// but sendMessageAck now fetches it internally. Pass empty string for sender.
-	s.sendMessageAck(messageID, ackingUserID, "", status)
+	// 2. Attempt to update DB status IF message was found there initially
+	if foundInDB {
+		update := bson.M{"$set": bson.M{"status": status}}
+		now := time.Now()
+		if status == "delivered" {
+			update["$set"].(bson.M)["delivered_at"] = now
+		}
+		if status == "read" {
+			update["$set"].(bson.M)["read_at"] = now
+			update["$set"].(bson.M)["delivered_at"] = now
+		} // Assume delivered if read
+
+		result, updateErr := messagesCollection.UpdateOne(s.ctx, bson.M{"id": messageID}, update)
+
+		// --- FIX: Added curly braces to the 'if' block ---
+		if updateErr != nil {
+			log.Printf("ERROR updating message %s status to '%s' via external ack: %v", messageID, status, updateErr)
+		} else if result.MatchedCount > 0 && result.ModifiedCount > 0 {
+			log.Printf("Updated status msg %s to '%s' via external ack from %s (DB)", messageID, status, ackingUserID)
+		} else if result.MatchedCount > 0 { // Use plain 'else if' here now
+			log.Printf("INFO: Status update for msg %s to '%s' from %s resulted in no DB modification.", messageID, status, ackingUserID)
+		}
+		// --- End Fix ---
+
+	} else {
+		// If not found in DB initially, log that update is skipped for now
+		log.Printf("Skipping DB status update for msg %s (not found in initial lookup). Will be updated if message arrives later.", messageID)
+	}
+
+	// 3. Send notification back to the original sender IF we have sender/chatID details (from DB or Redis)
+	if fetchedSender != "" && fetchedChatID != "" {
+		s.sendMessageAck(messageID, ackingUserID, fetchedSender, fetchedChatID, status)
+		// Clean up Redis key if we successfully sent notification based on Redis data
+		if !foundInDB {
+			redisKey := fmt.Sprintf("ackinfo:%s", messageID)
+			_, delErr := s.redisClient.Del(s.ctx, redisKey).Result()
+			if delErr != nil {
+				log.Printf("WARN: Failed to delete ackinfo key %s from Redis after use: %v", redisKey, delErr)
+			}
+		}
+	} else {
+		log.Printf("Skipping send ack notification for msg %s because sender/chat details could not be determined.", messageID)
+	}
 }
 
 func (s *Server) handleClientGroupMessage(client *Client, groupID string, content json.RawMessage, clientMsgID string) {
@@ -1115,62 +1211,132 @@ func (s *Server) handleClientGroupMessage(client *Client, groupID string, conten
 	s.updateUserSequenceNumber(client.UserID, seqNum)
 }
 
+// server.go
+
+// ... other imports and code ...
+
 func (s *Server) routeGroupMessage(message MessagePacket) {
 	groupID := message.To
+
+	// *** Store Ack Info in Redis before batching/routing ***
+	ackInfo := AckInfo{Sender: message.From, ChatID: groupID} // ChatID is groupID here
+	ackInfoJSON, errMarshal := json.Marshal(ackInfo)
+	if errMarshal == nil {
+		redisKey := fmt.Sprintf("ackinfo:%s", message.ID)
+		errSet := s.redisClient.SetEX(s.ctx, redisKey, string(ackInfoJSON), ackInfoTTL).Err()
+		if errSet != nil {
+			log.Printf("WARN: Failed to set temporary ack info in Redis for group msg %s: %v", message.ID, errSet)
+		}
+	} else {
+		log.Printf("ERROR: Failed to marshal AckInfo for group msg %s: %v", message.ID, errMarshal)
+	}
+	// *** End Store Ack Info ***
+
+	// Fetch group metadata
 	collection := s.mongoClient.Database(s.dbName).Collection("groups")
 	var group GroupMetadata
 	err := collection.FindOne(s.ctx, bson.M{"_id": groupID}).Decode(&group)
 	if err != nil {
-		log.Printf("Error fetching group %s: %v", groupID, err)
+		log.Printf("Error fetching group %s for routing message %s: %v", groupID, message.ID, err)
+		// Optionally send error back to sender? For now, just log and stop routing.
 		return
 	}
+
+	// Distribute message to members
 	membersOnThisInstance := []string{}
 	membersByInstance := make(map[string][]string)
 	offlineMembers := []string{}
+
 	for _, memberID := range group.Members {
+		// Don't send message back to the original sender
 		if memberID == message.From {
 			continue
 		}
+
+		// Check local connections
 		s.connectionsMux.RLock()
 		member, ok := s.connections[memberID]
 		s.connectionsMux.RUnlock()
+
 		if ok && member.IsConnected {
 			membersOnThisInstance = append(membersOnThisInstance, memberID)
 		} else {
+			// Check Redis for other instances
 			instanceID, err := s.redisClient.Get(s.ctx, fmt.Sprintf("user:%s:instance", memberID)).Result()
 			if err == nil && instanceID != "" && instanceID != s.instanceID {
 				membersByInstance[instanceID] = append(membersByInstance[instanceID], memberID)
 			} else {
+				// User is offline or Redis lookup failed
+				if err != nil && !errors.Is(err, redis.Nil) {
+					log.Printf("WARN: Redis error checking instance for group member %s: %v", memberID, err)
+				}
 				offlineMembers = append(offlineMembers, memberID)
 			}
 		}
 	}
-	messageJSON, _ := json.Marshal(message)
+
+	// Prepare the message copy to send (with 'sent' status)
+	recipientCopy := message // Status is already 'sent' from handleClientGroupMessage
+	messageJSON, errMarshalMsg := json.Marshal(recipientCopy)
+	if errMarshalMsg != nil {
+		log.Printf("CRITICAL: Failed to marshal group message %s for routing: %v", message.ID, errMarshalMsg)
+		return // Cannot proceed if message can't be marshaled
+	}
+
+	// Send to local members
 	for _, memberID := range membersOnThisInstance {
 		s.connectionsMux.RLock()
 		member, ok := s.connections[memberID]
 		s.connectionsMux.RUnlock()
 		if ok && member.IsConnected {
-			member.Send <- messageJSON
-			s.sendMessageAck(message.ID, memberID, message.From, "delivered")
+			select {
+			case member.Send <- messageJSON:
+				log.Printf("Routed group message %s to local member %s", message.ID, memberID)
+				// No immediate 'delivered' ack from server
+			default:
+				log.Printf("WARN: Send chan full for local group member %s (Conn %s), dropping group msg %s", memberID, member.ConnectionID, message.ID)
+				// Consider storing pending if local send fails?
+				// offlineMembers = append(offlineMembers, memberID) // Add to offline list if send fails?
+			}
 		}
 	}
+
+	// Forward to other instances via Redis
 	for instanceID, members := range membersByInstance {
 		forwardCmd, _ := json.Marshal(map[string]interface{}{
 			"type":     "forward_group_message",
 			"group_id": groupID,
-			"members":  members,
-			"payload":  string(messageJSON),
+			"members":  members,             // List of members on that specific instance
+			"payload":  string(messageJSON), // The message to forward
 		})
-		s.redisClient.Publish(s.ctx, fmt.Sprintf("instance:%s", instanceID), forwardCmd)
+		errPub := s.redisClient.Publish(s.ctx, fmt.Sprintf("instance:%s", instanceID), forwardCmd).Err()
+		if errPub != nil {
+			log.Printf("ERROR publishing forward_group_message for group %s to instance %s: %v", groupID, instanceID, errPub)
+			// Add these members to offline list if forwarding fails?
+			// offlineMembers = append(offlineMembers, members...)
+		} else {
+			log.Printf("Forwarded group message %s via Redis to %d members on instance %s", message.ID, len(members), instanceID)
+		}
 	}
+
+	// Store pending for offline members
+	// Note: Current logic stores one pending message per offline member, targeted at them.
+	// An alternative is storing one message per group, targeted at the groupID,
+	// and handling delivery upon member connection (more complex).
 	for _, memberID := range offlineMembers {
-		memberMsg := message
-		memberMsg.To = memberID
-		s.storePendingMessage(memberMsg)
+		pendingMsg := message    // Store the original 'sent' message
+		pendingMsg.To = memberID // Target the specific offline member
+		s.storePendingMessage(pendingMsg)
 	}
+
+	// Add original 'sent' message to batch for DB insertion AFTER routing/storing ack info
 	s.addToBatch("messages", message)
-	collection.UpdateOne(s.ctx, bson.M{"_id": groupID}, bson.M{"$set": bson.M{"last_message": message.Timestamp}})
+
+	// Update group's last message time in DB
+	_, updateErr := collection.UpdateOne(s.ctx, bson.M{"_id": groupID}, bson.M{"$set": bson.M{"last_message": message.Timestamp}})
+	if updateErr != nil {
+		log.Printf("WARN: Failed update group %s last_message time: %v", groupID, updateErr)
+	}
 }
 
 func (s *Server) handleCreateGroup(client *Client, name string, members []string) {
@@ -1233,9 +1399,17 @@ func (s *Server) handleCreateGroup(client *Client, name string, members []string
 	s.kafkaClient.PublishEvent(event)
 }
 
+// This function handles when a client explicitly sends a message_ack (e.g., for 'read')
 func (s *Server) handleMessageAck(client *Client, messageID, status string) {
-	s.sendMessageAck(messageID, client.UserID, "", status)
-	client.removeUnacknowledgedMessage(messageID)
+	// Use processAcknowledgment which handles DB update and notifying the sender
+	// It needs the acking user (client.UserID) and the status from the client message
+	s.processAcknowledgment(messageID, client.UserID, status)
+
+	// The `removeUnacknowledgedMessage` for the *sender* is now handled within `sendMessageAck`
+	// when the notification is successfully routed (locally or via Redis).
+	// No need to remove it here for the acking client unless tracking received unacked messages.
+
+	log.Printf("Processed client '%s' ack for message %s from user %s", status, messageID, client.UserID)
 }
 
 func (s *Server) addToBatch(collection string, document interface{}) {
